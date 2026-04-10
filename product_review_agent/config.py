@@ -32,8 +32,8 @@ PROPORTION_SUM_TOLERANCE = 0.05  # 占比总和容差（±5%）
 # ============================================================
 # 飞书配置（长连接WebSocket模式）
 # ============================================================
-FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "cli_a95f771655fa1bce")
-FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "jBeC63k7Mcts4yRuZIOW9gfKuI8WaRO8")
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 # 飞书连接模式: "websocket" (长连接,无需公网IP) | "webhook" (需要公网URL)
 FEISHU_MODE = os.getenv("FEISHU_MODE", "websocket")
 
