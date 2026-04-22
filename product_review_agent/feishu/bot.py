@@ -145,9 +145,9 @@ _patch_ws_client_card_handler()
 
 logger = logging.getLogger(__name__)
 
-# 飞书 App 凭证
-FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "cli_a95f771655fa1bce")
-FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "jBeC63k7Mcts4yRuZIOW9gfKuI8WaRO8")
+# 飞书 App 凭证（从环境变量读取，无默认值防止误用旧凭证）
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 
 # 全局会话管理器
 session_manager = SessionManager()
@@ -247,6 +247,70 @@ def send_card_to_chat(client: lark.Client, chat_id: str, card: dict):
     else:
         logger.info(f"发送卡片成功: chat_id={chat_id}")
     return response
+
+
+def _upload_file_to_feishu(client: lark.Client, file_path: str) -> Optional[str]:
+    """
+    上传文件到飞书，返回 file_key。
+
+    使用 im/v1/files 接口上传（适用于消息中发送文件）。
+    """
+    try:
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
+        file_name = os.path.basename(file_path)
+
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        request = CreateFileRequest.builder() \
+            .request_body(
+                CreateFileRequestBody.builder()
+                .file_type("stream")
+                .file_name(file_name)
+                .file(file_data)
+                .build()
+            ) \
+            .build()
+
+        response = client.im.v1.file.create(request)
+        if response.success():
+            file_key = response.data.file_key
+            logger.info(f"文件上传成功: file_key={file_key}, name={file_name}")
+            return file_key
+        else:
+            logger.error(f"文件上传失败: code={response.code}, msg={response.msg}")
+            return None
+
+    except Exception as e:
+        logger.error(f"文件上传异常: {e}", exc_info=True)
+        return None
+
+
+def _send_file_message(client: lark.Client, chat_id: str, file_key: str, file_name: str):
+    """发送文件消息到聊天"""
+    try:
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("file")
+                .content(json.dumps({"file_key": file_key, "file_name": file_name}))
+                .build()
+            ) \
+            .build()
+
+        response = client.im.v1.message.create(request)
+        if response.success():
+            logger.info(f"文件消息发送成功: chat_id={chat_id}, file={file_name}")
+        else:
+            logger.error(f"文件消息发送失败: code={response.code}, msg={response.msg}")
+        return response
+
+    except Exception as e:
+        logger.error(f"发送文件消息异常: {e}", exc_info=True)
+        return None
 
 
 # ============================================================
@@ -360,6 +424,61 @@ def _run_review_in_thread(
                 chunk = report_text[i:i + chunk_size]
                 reply_text_message(worker_client, message_id, chunk)
             logger.info(f"[{tname}] 完整报告已发送")
+
+        # Step 4: 生成并发送 Word 审核报告
+        logger.info(f"[{tname}] Step 4/4: 生成 Word 报告...")
+        try:
+            from product_review_agent.docx_generator import generate_review_docx
+
+            # 将 specific_score 转为 dict（兼容 AnalyzerScore 对象）
+            specific_dict = {}
+            if result.specific_score:
+                if hasattr(result.specific_score, "total_score"):
+                    # AnalyzerScore 对象 → dict
+                    specific_dict = {
+                        "total_score": result.specific_score.total_score,
+                        "dimensions": [
+                            {"name": d.name, "score": d.score, "max_score": d.max_score, "reason": d.reason}
+                            if hasattr(d, "name") else d
+                            for d in (result.specific_score.dimensions or [])
+                        ],
+                        "strengths": result.specific_score.strengths or [],
+                        "weaknesses": result.specific_score.weaknesses or [],
+                        "suggestions": result.specific_score.suggestions or [],
+                    }
+                elif isinstance(result.specific_score, dict):
+                    specific_dict = result.specific_score
+
+            common_dict = result.common_scores or {}
+
+            docx_path = generate_review_docx(
+                file_name=file_name,
+                task_label=result.task_label or task_label,
+                overall_score=result.overall_score,
+                risk_level=result.risk_level,
+                project_data=result.project_data or {},
+                specific_score=specific_dict,
+                common_scores=common_dict,
+                report_text=result.report or "",
+            )
+            logger.info(f"[{tname}] Word 报告已生成: {docx_path}")
+
+            # 上传文件到飞书并发送
+            file_key = _upload_file_to_feishu(worker_client, docx_path)
+            if file_key:
+                _send_file_message(worker_client, chat_id, file_key, os.path.basename(docx_path))
+                logger.info(f"[{tname}] Word 报告已发送到飞书")
+            else:
+                logger.warning(f"[{tname}] Word 报告上传失败，跳过发送")
+
+            # 清理临时文件
+            try:
+                os.remove(docx_path)
+            except OSError:
+                pass
+
+        except Exception as e:
+            logger.error(f"[{tname}] 生成/发送 Word 报告失败: {e}", exc_info=True)
 
         logger.info(f"[{tname}] ========== 审核线程完成 ==========")
 
@@ -567,6 +686,15 @@ def on_card_action_trigger(data) -> dict:
 
 def start_bot():
     """启动飞书长连接Bot"""
+    # 检查凭证
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        logger.error("=" * 60)
+        logger.error("  飞书凭证未配置！请在 .env 中设置：")
+        logger.error("    FEISHU_APP_ID=cli_xxxxxxxx")
+        logger.error("    FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx")
+        logger.error("=" * 60)
+        sys.exit(1)
+
     logger.info("=" * 60)
     logger.info("  产品立项审核 - 飞书Bot (长连接模式)")
     logger.info("=" * 60)
