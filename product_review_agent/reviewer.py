@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-产品立项审核核心逻辑 - 供飞书Bot / 命令行 / API 共用
+产品立项审核 — 公共评分模块
 
-流程:
-    1. 解析Excel模板 -> 结构化数据
-    2. 异步并行: 人群评分 / 场景评分 / 九宫格评分 (三线并行)
-    3. 生成文字审核报告
+本文件仅保留被 pipeline.py 复用的核心函数：
+  1. _build_audience_prompt / _build_scenario_prompt / _build_competitive_prompt — Prompt构建
+  2. _fallback_score — 规则引擎回退评分
+  3. ascore_with_llm — 异步LLM评分（核心）
+  4. analyze_with_history — 同类产品分析
+
+主流程入口请使用: from product_review_agent.pipeline import run_pipeline
+命令行入口请使用: scripts/review_from_template.py（已改为调用 pipeline）
 """
 
 from __future__ import annotations
@@ -13,13 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
-from product_review_agent.parsers.template_parser import TemplateParser, TemplateParseResult
 from product_review_agent.agents.llm_client import get_llm_client, LLMClient
 
 logger = logging.getLogger(__name__)
@@ -31,39 +30,53 @@ logger = logging.getLogger(__name__)
 
 def _build_audience_prompt(text: str) -> str:
     return (
-        '你是一个电商产品立项审核专家。请对以下"人群分析"数据进行评分，返回纯JSON（不要任何多余文字）。\n\n'
-        '评分维度（每项25分，总分100分）：\n'
+        '【任务】对以下"人群分析"数据进行评分。\n'
+        '【规则】只返回一个合法的JSON对象，不要输出任何其他文字、解释或markdown格式。\n'
+        '【评分维度】每项25分，总分100分：\n'
         '1. 目标人群明确性：核心人群是否有清晰定义（年龄、性别、画像特征）\n'
         '2. 数据支撑度：是否有量化数据（占比、百分比、市场规模等）\n'
         '3. 痛点分析深度：是否明确了人群痛点和需求，痛点描述是否具体\n'
         '4. 细分合理性：人群细分是否合理、有层次、有主次区分\n\n'
-        f'人群数据：\n{text}\n\n'
-        '返回JSON格式：\n'
-        '{"total_score": 整数0-100, "dimensions": {"目标人群明确性": {"score": 0-25, "reason": "说明"}, '
-        '"数据支撑度": {"score": 0-25, "reason": "说明"}, '
-        '"痛点分析深度": {"score": 0-25, "reason": "说明"}, '
-        '"细分合理性": {"score": 0-25, "reason": "说明"}}, '
-        '"strengths": ["优势1", "优势2"], "weaknesses": ["不足1", "不足2"], '
-        '"suggestions": ["建议1", "建议2"]}'
+        f'【人群数据】\n{text}\n\n'
+        '【输出格式】严格按此JSON结构输出（score必须是0-25的整数，reason是简短说明，strengths/weaknesses/suggestions各2-3条）：\n'
+        '{\n'
+        '  "total_score": 75,\n'
+        '  "dimensions": {\n'
+        '    "目标人群明确性": {"score": 20, "reason": "核心人群定义清晰"},\n'
+        '    "数据支撑度": {"score": 18, "reason": "有市场规模数据"},\n'
+        '    "痛点分析深度": {"score": 19, "reason": "痛点描述具体"},\n'
+        '    "细分合理性": {"score": 18, "reason": "细分有层次"}\n'
+        '  },\n'
+        '  "strengths": ["优势1", "优势2"],\n'
+        '  "weaknesses": ["不足1", "不足2"],\n'
+        '  "suggestions": ["建议1", "建议2"]\n'
+        '}'
     )
 
 
 def _build_scenario_prompt(text: str) -> str:
     return (
-        '你是一个电商产品立项审核专家。请对以下"场景分析"数据进行评分，返回纯JSON（不要任何多余文字）。\n\n'
-        '评分维度（每项25分，总分100分）：\n'
+        '【任务】对以下"场景分析"数据进行评分。\n'
+        '【规则】只返回一个合法的JSON对象，不要输出任何其他文字、解释或markdown格式。\n'
+        '【评分维度】每项25分，总分100分：\n'
         '1. 核心场景清晰度：主场景是否明确，是否有优先级排序\n'
         '2. 场景覆盖完整性：是否覆盖了用户主要使用场景\n'
         '3. 问题需求分析：每个场景是否有清晰的问题描述和需求提取\n'
         '4. 场景价值评估：场景是否有商业价值判断（规模、频次、付费意愿）\n\n'
-        f'场景数据：\n{text}\n\n'
-        '返回JSON格式：\n'
-        '{"total_score": 整数0-100, "dimensions": {"核心场景清晰度": {"score": 0-25, "reason": "说明"}, '
-        '"场景覆盖完整性": {"score": 0-25, "reason": "说明"}, '
-        '"问题需求分析": {"score": 0-25, "reason": "说明"}, '
-        '"场景价值评估": {"score": 0-25, "reason": "说明"}}, '
-        '"strengths": ["优势1", "优势2"], "weaknesses": ["不足1", "不足2"], '
-        '"suggestions": ["建议1", "建议2"]}'
+        f'【场景数据】\n{text}\n\n'
+        '【输出格式】严格按此JSON结构输出（score必须是0-25的整数，reason是简短说明，strengths/weaknesses/suggestions各2-3条）：\n'
+        '{\n'
+        '  "total_score": 70,\n'
+        '  "dimensions": {\n'
+        '    "核心场景清晰度": {"score": 18, "reason": "主场景明确"},\n'
+        '    "场景覆盖完整性": {"score": 17, "reason": "覆盖主要场景"},\n'
+        '    "问题需求分析": {"score": 18, "reason": "问题描述清晰"},\n'
+        '    "场景价值评估": {"score": 17, "reason": "有商业价值判断"}\n'
+        '  },\n'
+        '  "strengths": ["优势1", "优势2"],\n'
+        '  "weaknesses": ["不足1", "不足2"],\n'
+        '  "suggestions": ["建议1", "建议2"]\n'
+        '}'
     )
 
 
@@ -78,9 +91,9 @@ def _build_competitive_prompt(project_data: dict) -> str:
     competitor_sku = project_data.get("competitor_sku", "未填写")
 
     return (
-        '你是一个电商产品立项审核专家。请对以下"九宫格目标"板块的填写质量进行评估，'
-        '重点考察填写的完整度和严谨性，返回纯JSON（不要任何多余文字）。\n\n'
-        '评分维度（每项25分，总分100分）：\n'
+        '【任务】对以下"九宫格目标"板块的填写质量进行评分，重点考察完整度和严谨性。\n'
+        '【规则】只返回一个合法的JSON对象，不要输出任何其他文字、解释或markdown格式。\n'
+        '【评分维度】每项25分，总分100分：\n'
         '1. 信息完整度：各字段是否都已填写（竞争对手、竞品卖点、差异化策略、定价/毛利、市场规模等），'
         '缺失字段是否影响评审判断\n'
         '2. 数据严谨性：填写的竞品销售额、市场规模、价格等数据是否有量化支撑，'
@@ -89,7 +102,7 @@ def _build_competitive_prompt(project_data: dict) -> str:
         '定价策略与毛利目标是否匹配\n'
         '4. 分析深度：是否只简单列了对手名称而没有深入分析竞品，'
         '差异化策略是否有具体方案而非口号式描述\n\n'
-        f'== 项目方填写的数据 ==\n'
+        f'【项目方填写的数据】\n'
         f'竞争对手: {competitor_name}\n'
         f'竞品SKU: {competitor_sku}\n'
         f'竞品销售额: {competitor_sales}\n'
@@ -98,14 +111,20 @@ def _build_competitive_prompt(project_data: dict) -> str:
         f'定价/毛利: {price_margin}\n'
         f'市场规模: {market_size}\n\n'
         '请仅基于以上填写内容，评估完整度和严谨性。不要凭外部知识判断数据真伪，'
-        '而是看填写者是否做到了认真、细致、有据可循。\n'
-        '返回JSON格式：\n'
-        '{"total_score": 整数0-100, "dimensions": {"信息完整度": {"score": 0-25, "reason": "说明"}, '
-        '"数据严谨性": {"score": 0-25, "reason": "说明"}, '
-        '"逻辑自洽性": {"score": 0-25, "reason": "说明"}, '
-        '"分析深度": {"score": 0-25, "reason": "说明"}}, '
-        '"strengths": ["优势1", "优势2"], "weaknesses": ["不足1", "不足2"], '
-        '"suggestions": ["建议1", "建议2"]}'
+        '而是看填写者是否做到了认真、细致、有据可循。\n\n'
+        '【输出格式】严格按此JSON结构输出（score必须是0-25的整数，reason是简短说明，strengths/weaknesses/suggestions各2-3条）：\n'
+        '{\n'
+        '  "total_score": 65,\n'
+        '  "dimensions": {\n'
+        '    "信息完整度": {"score": 18, "reason": "大部分字段已填写"},\n'
+        '    "数据严谨性": {"score": 15, "reason": "部分数据缺少量化支撑"},\n'
+        '    "逻辑自洽性": {"score": 16, "reason": "策略基本自洽"},\n'
+        '    "分析深度": {"score": 16, "reason": "分析较为深入"}\n'
+        '  },\n'
+        '  "strengths": ["优势1", "优势2"],\n'
+        '  "weaknesses": ["不足1", "不足2"],\n'
+        '  "suggestions": ["建议1", "建议2"]\n'
+        '}'
     )
 
 
@@ -201,7 +220,7 @@ async def ascore_with_llm(
 
     try:
         result = await llm.achat(
-            system_prompt="你是一个严谨的电商产品审核评分专家，请只返回JSON，不要任何其他文字。",
+            system_prompt="你是一个严谨的电商产品审核评分专家。严格只返回JSON对象，禁止输出思考过程、解释文字或markdown代码块。",
             user_prompt=prompt,
             response_format="json",
         )
@@ -255,410 +274,40 @@ async def ascore_with_llm(
         llm.max_tokens = original_max_tokens
 
 
-async def async_competitive_analysis(
-    llm: LLMClient,
-    competitor_name: str,
-    category: str,
-    project_data: dict,
-) -> tuple[dict, dict]:
-    """九宫格目标评分"""
-    competitor_info = {
-        "competitor_name": competitor_name,
-        "category": category,
-        "source": "project_data_only",
-    }
-
-    logger.info(f"    [九宫格评分] 评估填写完整度和严谨性...")
-    competitive_prompt = _build_competitive_prompt(project_data)
-    competitive_score = await ascore_with_llm(
-        llm, "competitive", "competitive", extra_context=competitive_prompt,
-    )
-    logger.info(f"    [九宫格评分] {competitive_score.get('total_score', '?')}/100")
-
-    return competitor_info, competitive_score
-
-
 # ============================================================
-# 审核结果数据类
+# 同类产品分析（产品库检索 + LLM 数据分析）
 # ============================================================
 
-@dataclass
-class ReviewResult:
-    """审核结果"""
-    file_name: str
-    parse_result: TemplateParseResult
-    scores: dict = field(default_factory=dict)
-    report: str = ""
-    overall_score: int = 0
-    risk_level: str = "未知"
-    elapsed_seconds: float = 0.0
-    error: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "file_name": self.file_name,
-            "overall_score": self.overall_score,
-            "risk_level": self.risk_level,
-            "elapsed_seconds": round(self.elapsed_seconds, 1),
-            "scores": self.scores,
-            "error": self.error,
-        }
-
-
-# ============================================================
-# 核心审核函数 - 供外部调用
-# ============================================================
-
-async def review_excel(file_path: str | Path) -> ReviewResult:
+async def analyze_with_history(project_data: dict) -> dict:
     """
-    审核一个Excel文件，返回 ReviewResult。
-
-    可供飞书Bot、命令行脚本、API等统一调用。
-
-    Args:
-        file_path: Excel文件路径
-
-    Returns:
-        ReviewResult 审核结果
+    查产品库 + 拉销量 + LLM分析。
+    任何异常都降级返回空结果，不阻塞审核主流程。
     """
-    file_path = Path(file_path)
-    start_time = time.time()
-
-    if not file_path.exists():
-        return ReviewResult(
-            file_name=file_path.name,
-            parse_result=TemplateParseResult(file_path.name),
-            error=f"文件不存在: {file_path}",
-        )
-
-    # Step 1: 解析模板
-    logger.info(f"[审核] 开始解析: {file_path.name}")
-    parser = TemplateParser()
     try:
-        parse_result = parser.parse(file_path)
+        from product_review_agent.product_db.database import ProductDB
+        from product_review_agent.product_db.conflict_analyzer import analyze_with_sales_data
+
+        db = ProductDB()
+        # 兼容两种键名: category_l2 (旧) / categoryl2 (ExcelParsingAgent新格式)
+        category_l2 = project_data.get("category_l2") or project_data.get("categoryl2")
+        if not category_l2:
+            return {"products": [], "analysis": None}
+
+        products = db.get_products_by_category_l2(category_l2)
+        if not products:
+            return {"products": [], "analysis": None}
+
+        logger.info(f"[同类产品分析] 检索到 {len(products)} 个品类「{category_l2}」产品")
+
+        # LLM 基于真实数据做分析
+        llm = get_llm_client()
+        if not llm.is_available:
+            return {"products": products, "analysis": None, "error": "LLM不可用"}
+
+        analysis = await analyze_with_sales_data(llm, project_data, products)
+        db.close()
+        return {"products": products, "analysis": analysis}
+
     except Exception as e:
-        return ReviewResult(
-            file_name=file_path.name,
-            parse_result=TemplateParseResult(file_path.name),
-            error=f"解析失败: {e}",
-        )
-
-    logger.info(f"[审核] 解析完成, 提取字段数: {len(parse_result.data)}")
-
-    # Step 2: 异步并行评分
-    logger.info("[审核] 开始异步并行评分...")
-    llm = get_llm_client()
-
-    tasks = {}
-    task_labels = {}
-
-    # 人群评分
-    audience_text = parse_result.data.get("target_audience", "")
-    if audience_text and "[图片" not in audience_text:
-        tasks["audience"] = ascore_with_llm(llm, audience_text, "audience")
-        task_labels["audience"] = "人群评分"
-    else:
-        tasks["audience"] = asyncio.coroutine(lambda: _fallback_score("audience", reason="no_data"))()
-        task_labels["audience"] = "人群(跳过)"
-
-    # 场景评分
-    scenario_text = parse_result.data.get("usage_scenarios", "")
-    if scenario_text and "[图片" not in scenario_text:
-        tasks["scenario"] = ascore_with_llm(llm, scenario_text, "scenario")
-        task_labels["scenario"] = "场景评分"
-    else:
-        tasks["scenario"] = asyncio.coroutine(lambda: _fallback_score("scenario", reason="no_data"))()
-        task_labels["scenario"] = "场景(跳过)"
-
-    # 九宫格评分
-    competitor_name = parse_result.data.get("competitor_name", "")
-    category = " > ".join(filter(None, [
-        parse_result.data.get("category_l1", ""),
-        parse_result.data.get("category_l2", ""),
-    ])) or parse_result.data.get("category_l1", "")
-
-    if competitor_name and competitor_name not in ["(未填写)", "/", "-"]:
-        tasks["competitive"] = async_competitive_analysis(llm, competitor_name, category, parse_result.data)
-        task_labels["competitive"] = f"九宫格 ({competitor_name})"
-    else:
-        tasks["competitive"] = asyncio.coroutine(lambda: (
-            {"research_text": "未填写", "source": "skip"},
-            _fallback_score("competitive", reason="no_data"),
-        ))()
-        task_labels["competitive"] = "九宫格(跳过)"
-
-    # 并行执行
-    logger.info(f"[审核] 并行启动: {', '.join(task_labels.values())}")
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-    # 解析结果
-    scores = {}
-    task_keys = list(tasks.keys())
-    for key, result_val in zip(task_keys, results):
-        label = task_labels[key]
-        if isinstance(result_val, Exception):
-            logger.warning(f"  [{label}] 失败: {result_val}")
-            scores[key] = _fallback_score(key)
-        elif key == "competitive":
-            if isinstance(result_val, tuple) and len(result_val) == 2:
-                _, competitive_score = result_val
-                scores["competitive"] = competitive_score
-            else:
-                scores["competitive"] = _fallback_score("competitive")
-        else:
-            scores[key] = result_val
-
-    # Step 3: 生成报告
-    report = generate_report(parse_result, scores)
-
-    # 计算综合分
-    audience_total = scores.get("audience", {}).get("total_score", 0)
-    scenario_total = scores.get("scenario", {}).get("total_score", 0)
-    competitive_total = scores.get("competitive", {}).get("total_score", 0)
-
-    valid_scores = []
-    if audience_total > 0:
-        valid_scores.append(("人群", audience_total))
-    if scenario_total > 0:
-        valid_scores.append(("场景", scenario_total))
-    if competitive_total > 0:
-        valid_scores.append(("九宫格", competitive_total))
-
-    overall = 0
-    risk = "未知"
-    if valid_scores:
-        weights = {"人群": 0.3, "场景": 0.3, "九宫格": 0.4}
-        total_weight = sum(weights.get(n, 0) for n, _ in valid_scores)
-        if total_weight > 0:
-            overall = int(round(sum(s * weights.get(n, 0) / total_weight for n, s in valid_scores)))
-        else:
-            overall = sum(s for _, s in valid_scores) // len(valid_scores)
-
-        if overall >= 80:
-            risk = "低"
-        elif overall >= 60:
-            risk = "中"
-        else:
-            risk = "高"
-
-    elapsed = time.time() - start_time
-    logger.info(f"[审核] 完成, 综合评分: {overall}/100, 风险: {risk}, 耗时: {elapsed:.1f}s")
-
-    return ReviewResult(
-        file_name=file_path.name,
-        parse_result=parse_result,
-        scores=scores,
-        report=report,
-        overall_score=overall,
-        risk_level=risk,
-        elapsed_seconds=elapsed,
-    )
-
-
-# ============================================================
-# 文字报告生成
-# ============================================================
-
-SEPARATOR = "=" * 78
-THIN_SEP = "-" * 78
-
-
-def score_stars(score: int) -> int:
-    if score >= 90: return 5
-    elif score >= 75: return 4
-    elif score >= 60: return 3
-    elif score >= 40: return 2
-    else: return 1
-
-
-def stars_display(n: int) -> str:
-    return "*" * n + "-" * (5 - n)
-
-
-def _append_score_detail(lines: list, score: dict, total: int, section_name: str):
-    """将评分明细追加到报告行列表中"""
-    if score and total > 0:
-        lines.append("[评分明细]")
-        for dim_name, dim_info in score.get("dimensions", {}).items():
-            s = dim_info.get("score", 0) if isinstance(dim_info, dict) else 0
-            r = dim_info.get("reason", "") if isinstance(dim_info, dict) else str(dim_info)
-            lines.append(f"  {dim_name}: {s}/25 - {r}")
-        lines.append("")
-
-        for label, key in [("优势", "strengths"), ("不足", "weaknesses"), ("改进建议", "suggestions")]:
-            items = score.get(key, [])
-            if items:
-                prefix = "+" if label == "优势" else ("-" if label == "不足" else ">")
-                lines.append(f"[{label}]")
-                for item in items:
-                    lines.append(f"  {prefix} {item}")
-                lines.append("")
-    else:
-        lines.append(f"  ({section_name}评分不可用 - 请查看上方原因)")
-        lines.append("")
-
-
-def generate_report(result: TemplateParseResult, scores: dict) -> str:
-    """生成文字版审核报告"""
-    d = result.data
-    lines = []
-
-    # 标题
-    lines.append(SEPARATOR)
-    lines.append("                    产品立项审核报告")
-    lines.append(SEPARATOR)
-    lines.append("")
-
-    # 产品概览
-    product_name = d.get("product_name", "(未填写)")
-    brand = d.get("brand", "(未填写)")
-    cat = " > ".join(filter(None, [
-        d.get("category_l1"), d.get("category_l2"), d.get("category_l3")
-    ])) or "(未填写)"
-    owner = d.get("owner", "(未填写)")
-    competitor = d.get("competitor_name", "(未填写)")
-
-    lines.append(f"产品名称: {product_name}")
-    lines.append(f"品牌: {brand}")
-    lines.append(f"品类: {cat}")
-    lines.append(f"负责人: {owner}")
-    lines.append(f"竞争对手: {competitor}")
-    lines.append(f"来源文件: {result.file_name}")
-    lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    lines.append("")
-
-    # 立项信息
-    lines.append(THIN_SEP)
-    lines.append("一、立项信息")
-    lines.append(THIN_SEP)
-    for key in ["立项时间", "设计时间", "打样时间", "上架时间"]:
-        lines.append(f"  {key}: {d.get(key, '(未填写)')}")
-    lines.append("")
-
-    # 市场信息
-    lines.append(THIN_SEP)
-    lines.append("二、市场信息")
-    lines.append(THIN_SEP)
-    lines.append(f"  市场规模: {d.get('market_size', '(未填写)')}")
-    lines.append(f"  对手销售额: {d.get('competitor_sales', '(未填写)')}")
-    lines.append(f"  对手SKU: {d.get('competitor_sku', '(未填写)')}")
-    lines.append("")
-
-    # 人群分析
-    audience_text = d.get("target_audience", "")
-    audience_score = scores.get("audience", {})
-    audience_total = audience_score.get("total_score", 0)
-
-    lines.append(THIN_SEP)
-    lines.append(f"三、人群分析 [评分: {audience_total}/100] [{stars_display(score_stars(audience_total))}]")
-    lines.append(THIN_SEP)
-
-    if audience_text:
-        lines.append("[原始数据]")
-        for l in audience_text.split("\n"):
-            lines.append(f"  {l}")
-        lines.append("")
-    _append_score_detail(lines, audience_score, audience_total, "人群")
-
-    # 场景分析
-    scenario_text = d.get("usage_scenarios", "")
-    scenario_score = scores.get("scenario", {})
-    scenario_total = scenario_score.get("total_score", 0)
-
-    lines.append(THIN_SEP)
-    lines.append(f"四、场景分析 [评分: {scenario_total}/100] [{stars_display(score_stars(scenario_total))}]")
-    lines.append(THIN_SEP)
-
-    if scenario_text:
-        lines.append("[原始数据]")
-        for l in scenario_text.split("\n"):
-            lines.append(f"  {l}")
-        lines.append("")
-    _append_score_detail(lines, scenario_score, scenario_total, "场景")
-
-    # 九宫格目标
-    competitive_score = scores.get("competitive", {})
-    competitive_total = competitive_score.get("total_score", 0)
-
-    lines.append(THIN_SEP)
-    lines.append(f"五、九宫格目标 [评分: {competitive_total}/100] [{stars_display(score_stars(competitive_total))}]")
-    lines.append(THIN_SEP)
-    lines.append(f"  价格/毛利: {d.get('price_margin', '(未填写)')}")
-    lines.append(f"  竞争对手: {d.get('competitor_name', '(未填写)')}")
-    lines.append(f"  对手SKU: {d.get('competitor_sku', '(未填写)')}")
-    lines.append(f"  对手销售额: {d.get('competitor_sales', '(未填写)')}")
-    lines.append(f"  对手卖点(复制): {d.get('competitor_strengths_copy', '(未填写)')}")
-    lines.append(f"  对手卖点(超越): {d.get('competitor_advantage', '(未填写)')}")
-    lines.append("")
-    _append_score_detail(lines, competitive_score, competitive_total, "九宫格")
-
-    # 设计要求
-    lines.append(THIN_SEP)
-    lines.append("六、设计要求")
-    lines.append(THIN_SEP)
-    for key, label in [
-        ("design_purpose", "设计目的"), ("appearance_change", "改外观/品牌"),
-        ("material_change", "改材料"), ("function_change", "改功能"),
-    ]:
-        lines.append(f"  {label}: {d.get(key, '(未填写)')}")
-    lines.append("")
-
-    # 具体情况
-    lines.append(THIN_SEP)
-    lines.append("七、具体情况")
-    lines.append(THIN_SEP)
-    for key, label in [
-        ("upgrade_details", "升级方向"), ("model_number", "产品型号"), ("erp_cost", "ERP成本"),
-    ]:
-        lines.append(f"  {label}: {d.get(key, '(未填写)')}")
-    lines.append("")
-
-    # 综合评估
-    lines.append(THIN_SEP)
-    lines.append("八、综合评估")
-    lines.append(THIN_SEP)
-
-    valid_scores = []
-    if audience_total > 0:
-        valid_scores.append(("人群", audience_total))
-    if scenario_total > 0:
-        valid_scores.append(("场景", scenario_total))
-    if competitive_total > 0:
-        valid_scores.append(("九宫格", competitive_total))
-
-    if valid_scores:
-        weights = {"人群": 0.3, "场景": 0.3, "九宫格": 0.4}
-        total_weight = sum(weights.get(n, 0) for n, _ in valid_scores)
-        if total_weight > 0:
-            overall = int(round(sum(s * weights.get(n, 0) / total_weight for n, s in valid_scores)))
-        else:
-            overall = sum(s for _, s in valid_scores) // len(valid_scores)
-
-        for name, score in valid_scores:
-            lines.append(f"  {name}评分: {score}/100")
-        lines.append(f"  综合评分: {overall}/100")
-        stars = score_stars(overall)
-        lines.append(f"  星级: [{stars_display(stars)}]")
-
-        if overall >= 80: risk = "低"
-        elif overall >= 60: risk = "中"
-        else: risk = "高"
-        lines.append(f"  风险等级: {risk}")
-    else:
-        lines.append("  综合评分: 暂无法评估（缺少人群/场景/竞品数据或LLM评分）")
-
-    lines.append("")
-
-    if result.warnings:
-        lines.append(THIN_SEP)
-        lines.append("附: 解析警告")
-        lines.append(THIN_SEP)
-        for w in result.warnings:
-            lines.append(f"  ! {w}")
-        lines.append("")
-
-    lines.append(SEPARATOR)
-    lines.append("报告结束")
-    lines.append(SEPARATOR)
-
-    return "\n".join(lines)
+        logger.error(f"[同类产品分析] 异常: {e}")
+        return {"products": [], "analysis": None, "error": str(e)}

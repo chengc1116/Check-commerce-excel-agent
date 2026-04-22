@@ -1,0 +1,91 @@
+/* ========== Dashboard Page ========== */
+#page-dashboard .category-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+#page-dashboard .category-bar .cat-name {
+  min-width: 80px;
+  font-size: 14px;
+  color: var(--text2);
+}
+#page-dashboard .category-bar .cat-count {
+  font-size: 14px;
+  color: var(--text3);
+  min-width: 40px;
+  text-align: right;
+}
+
+/* ========== Review Page ========== */
+.review-progress-text {
+  color: var(--text3);
+  font-size: 13px;
+  margin-top: 8px;
+}
+.review-score-row {
+  display: flex;
+  align-items: center;
+  gap: 32px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+.review-actions {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.review-dimension {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.review-dimension .dim-name {
+  min-width: 100px;
+  font-size: 13px;
+  color: var(--text2);
+}
+.review-dimension .dim-score {
+  font-size: 13px;
+  color: var(--text3);
+}
+
+/* ========== Products Page ========== */
+.product-filters {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+/* ========== CBB Page ========== */
+.cbb-filters {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.cbb-search-input {
+  padding: 6px 14px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  width: 240px;
+}
+
+/* ========== History Page ========== */
+.history-filters {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+/* ========== Import Page ========== */
+.import-result {
+  margin-top: 16px;
+}

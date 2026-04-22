@@ -11,6 +11,122 @@ import json
 from typing import Optional
 
 
+def build_task_selection_card() -> dict:
+    """
+    构建任务类型选择卡片。
+    
+    用户点击按钮后，飞书会发送 card.action.trigger 回调，
+    action.value 中包含 task_type 值（如 "hot_upgrade"）。
+    """
+    task_buttons = [
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🔥 爆品升级"},
+            "type": "primary",
+            "value": {"task_type": "hot_upgrade"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "⚔️ 竞品升级"},
+            "type": "primary",
+            "value": {"task_type": "competitor_upgrade"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📉 未起量迭代"},
+            "type": "primary",
+            "value": {"task_type": "low_sale_iterate"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🗺️ 品类地图缺失"},
+            "type": "primary",
+            "value": {"task_type": "category_gap"},
+        },
+    ]
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": "📋 请选择审核任务类型",
+            },
+            "template": "blue",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "请点击选择本次立项审核的任务类型：",
+                },
+            },
+            {
+                "tag": "action",
+                "actions": task_buttons,
+            },
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "选择后请上传Excel文件（.xlsx）开始审核。",
+                },
+            },
+        ],
+    }
+
+
+def build_task_selected_card(task_label: str, task_emoji: str) -> dict:
+    """构建任务选择确认卡片"""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": f"{task_emoji} 已选择: {task_label}",
+            },
+            "template": "green",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"您选择的审核类型: **{task_emoji} {task_label}**\n\n"
+                        f"请现在上传Excel文件（.xlsx）开始审核。\n\n"
+                        f"⏳ 选择5分钟内有效，超时需重新选择。"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+def build_no_task_selected_card() -> dict:
+    """构建提示用户先选择任务的卡片"""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": "⚠️ 请先选择任务类型",
+            },
+            "template": "orange",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "请先发送任意消息选择审核任务类型，然后再上传Excel文件。",
+                },
+            },
+        ],
+    }
+
+
 def _score_emoji(score: int) -> str:
     """评分对应emoji"""
     if score >= 80:
@@ -45,6 +161,9 @@ def build_review_card(
     elapsed: float,
     report_text: Optional[str] = None,
     error: Optional[str] = None,
+    product_analysis: Optional[dict] = None,
+    specific_score=None,
+    task_label: str = "",
 ) -> dict:
     """
     构建飞书审核结果消息卡片。
@@ -53,10 +172,13 @@ def build_review_card(
         file_name: 审核的文件名
         overall_score: 综合评分
         risk_level: 风险等级 (低/中/高)
-        scores: 各维度评分
+        scores: 各维度评分（公共：audience, scenario）
         elapsed: 耗时(秒)
         report_text: 完整文字报告(可选,用于折叠展示)
         error: 错误信息(如有)
+        product_analysis: 同类产品分析(可选,已整合到报告中)
+        specific_score: 专项分析评分(AnalyzerScore对象或dict)
+        task_label: 任务类型标签(如 "🔥 爆品升级")
 
     Returns:
         飞书消息卡片JSON
@@ -66,21 +188,24 @@ def build_review_card(
 
     audience_score = scores.get("audience", {}).get("total_score", 0)
     scenario_score = scores.get("scenario", {}).get("total_score", 0)
-    competitive_score = scores.get("competitive", {}).get("total_score", 0)
 
     # 构建评分维度行
     dimension_elements = []
 
     # 综合评分头部
+    header_content = f"**{file_name}** 审核完成\n"
+    if task_label:
+        header_content += f"审核类型: {task_label}\n"
+    header_content += (
+        f"综合评分: **{overall_score}/100** {_score_emoji(overall_score)}\n"
+        f"风险等级: **{risk_level}** | 耗时: {elapsed:.1f}s"
+    )
+
     dimension_elements.append({
         "tag": "div",
         "text": {
             "tag": "lark_md",
-            "content": (
-                f"**{file_name}** 审核完成\n"
-                f"综合评分: **{overall_score}/100** {_score_emoji(overall_score)}\n"
-                f"风险等级: **{risk_level}** | 耗时: {elapsed:.1f}s"
-            ),
+            "content": header_content,
         },
     })
 
@@ -105,7 +230,6 @@ def build_review_card(
             },
         })
 
-        # 优势/不足
         _append_strength_weakness(dimension_elements, scores.get("audience", {}))
 
     # 场景评分
@@ -129,35 +253,27 @@ def build_review_card(
 
         _append_strength_weakness(dimension_elements, scores.get("scenario", {}))
 
-    # 九宫格评分
-    if competitive_score > 0:
-        competitive_dims = scores.get("competitive", {}).get("dimensions", {})
-        dim_lines = []
-        for dim_name, dim_info in competitive_dims.items():
-            s = dim_info.get("score", 0) if isinstance(dim_info, dict) else 0
-            dim_lines.append(f"  {dim_name}: {s}/25")
-
-        dimension_elements.append({
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": (
-                    f"**九宫格目标** {competitive_score}/100 {_score_emoji(competitive_score)}\n"
-                    + "\n".join(dim_lines)
-                ),
-            },
-        })
-
-        _append_strength_weakness(dimension_elements, scores.get("competitive", {}))
+    # 🆕 专项分析评分
+    if specific_score:
+        dimension_elements.append({"tag": "hr"})
+        _append_specific_score_card(dimension_elements, specific_score)
 
     # 改进建议（汇总）
     all_suggestions = []
-    for key in ["audience", "scenario", "competitive"]:
+    for key in ["audience", "scenario"]:
         suggestions = scores.get(key, {}).get("suggestions", [])
         if suggestions:
-            label = {"audience": "人群", "scenario": "场景", "competitive": "九宫格"}[key]
+            label = {"audience": "人群", "scenario": "场景"}.get(key, key)
             for s in suggestions:
                 all_suggestions.append(f"[{label}] {s}")
+
+    # 专项分析建议
+    if specific_score and hasattr(specific_score, "suggestions"):
+        for s in specific_score.suggestions:
+            all_suggestions.append(f"[专项] {s}")
+    elif specific_score and isinstance(specific_score, dict):
+        for s in specific_score.get("suggestions", []):
+            all_suggestions.append(f"[专项] {s}")
 
     if all_suggestions:
         dimension_elements.append({"tag": "hr"})
@@ -165,7 +281,7 @@ def build_review_card(
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": "**改进建议**\n" + "\n".join(f"- {s}" for s in all_suggestions[:8]),
+                "content": "**改进建议**\n" + "\n".join(f"- {s}" for s in all_suggestions[:10]),
             },
         })
 
@@ -182,6 +298,70 @@ def build_review_card(
     }
 
     return card
+
+
+def _append_specific_score_card(elements: list, specific_score):
+    """在飞书卡片中追加专项分析评分板块"""
+    # 兼容 AnalyzerScore 对象和 dict
+    if hasattr(specific_score, "total_score"):
+        total = specific_score.total_score
+        analysis_type = getattr(specific_score, "analysis_type", "专项")
+        dimensions = specific_score.dimensions if hasattr(specific_score, "dimensions") else []
+        strengths = specific_score.strengths if hasattr(specific_score, "strengths") else []
+        weaknesses = specific_score.weaknesses if hasattr(specific_score, "weaknesses") else []
+    else:
+        total = specific_score.get("total_score", 0)
+        analysis_type = specific_score.get("analysis_type", "专项")
+        dimensions = specific_score.get("dimensions", [])
+        strengths = specific_score.get("strengths", [])
+        weaknesses = specific_score.get("weaknesses", [])
+
+    # 标题
+    type_labels = {
+        "hot_upgrade": "🔥 爆品升级",
+        "competitor_upgrade": "⚔️ 竞品升级",
+        "low_sale_iterate": "📉 未起量迭代",
+        "category_gap": "🗺️ 品类地图缺失",
+    }
+    label = type_labels.get(analysis_type, "📋 专项分析")
+
+    dim_lines = []
+    for d in dimensions:
+        if isinstance(d, dict):
+            name = d.get("name", "")
+            score = d.get("score", 0)
+            max_s = d.get("max_score", 25)
+            reason = d.get("reason", "")
+            dim_lines.append(f"  {name}: {score}/{max_s} - {reason}")
+        elif hasattr(d, "name"):
+            dim_lines.append(f"  {d.name}: {d.score}/{d.max_score} - {d.reason}")
+
+    content = f"**{label}专项分析** {total}/100 {_score_emoji(total)}\n"
+    if dim_lines:
+        content += "\n".join(dim_lines)
+
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": content,
+        },
+    })
+
+    # 优势/不足
+    lines = []
+    for s in strengths[:3]:
+        lines.append(f"+ {s}")
+    for w in weaknesses[:3]:
+        lines.append(f"- {w}")
+    if lines:
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "\n".join(lines),
+            },
+        })
 
 
 def _append_strength_weakness(elements: list, score: dict):
@@ -258,3 +438,75 @@ def build_processing_card(file_name: str) -> dict:
             },
         ],
     }
+
+
+def _append_product_analysis_card(elements: list, analysis: dict):
+    """在飞书卡片中追加同类产品分析板块"""
+    products = analysis.get("products", [])
+    ai_analysis = analysis.get("analysis")
+
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": "**同类产品及销售情况**（共 %d 个）" % len(products),
+        },
+    })
+
+    # 展示前5个产品的简要信息
+    for p in products[:5]:
+        sku = p.get("sku", "-")
+        brand = p.get("brand", "-")
+        version = p.get("version", "")
+        cat3 = p.get("category_l3", "")
+        sales = p.get("recent_sales", [])
+
+        label = f"{sku}"
+        if brand and brand != "-":
+            label += f" · {brand}"
+        if version:
+            label += f" · {version}"
+
+        # 销量趋势
+        if len(sales) >= 2:
+            m1 = sales[1].get("sales_volume", 0)
+            m2 = sales[0].get("sales_volume", 0)
+            trend = "↑" if m2 > m1 else ("↓" if m2 < m1 else "—")
+            sales_str = f"{m1} → {m2} {trend}"
+        elif len(sales) == 1:
+            sales_str = str(sales[0].get("sales_volume", 0))
+        else:
+            sales_str = "暂无数据"
+
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"• **{label}**  销量: {sales_str}",
+            },
+        })
+
+    if len(products) > 5:
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"... 还有 {len(products) - 5} 个产品，详见文字报告",
+            },
+        })
+
+    # AI 分析摘要
+    if ai_analysis and ai_analysis.get("analysis"):
+        elements.append({"tag": "hr"})
+        summary = ai_analysis["analysis"]
+        # 截取前300字
+        if len(summary) > 300:
+            summary = summary[:300] + "..."
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**AI分析**: %s" % summary,
+            },
+        })

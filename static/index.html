@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>产品立项审核系统</title>
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/pages.css">
+</head>
+<body>
+
+<!-- ========== Login Page ========== -->
+<div class="login-page" id="login-page">
+  <div class="login-card">
+    <div class="login-logo">📋</div>
+    <h1 class="login-title">产品立项审核系统</h1>
+    <p class="login-subtitle">Product Review Agent</p>
+    <div class="login-form">
+      <div class="form-group">
+        <label>用户名</label>
+        <input type="text" id="login-username" placeholder="请输入用户名" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>密码</label>
+        <input type="password" id="login-password" placeholder="请输入密码" autocomplete="current-password">
+      </div>
+      <div id="login-error" class="login-error" style="display:none"></div>
+      <button class="btn btn-primary login-btn" id="login-btn" onclick="doLogin()">登 录</button>
+    </div>
+  </div>
+</div>
+
+<div class="app" id="app-main" style="display:none">
+
+  <!-- ========== Sidebar ========== -->
+  <div class="sidebar">
+    <div class="sidebar-logo">
+      <h1>📋 立项审核</h1>
+      <p>Product Review Agent</p>
+    </div>
+    <div class="nav-item active" data-page="dashboard">
+      <span class="icon">📊</span><span>仪表盘</span>
+    </div>
+    <div class="nav-item" data-page="review">
+      <span class="icon">🔍</span><span>项目审核</span>
+    </div>
+    <div class="nav-item" data-page="products">
+      <span class="icon">📦</span><span>产品库</span>
+    </div>
+    <div class="nav-item" data-page="cbb">
+      <span class="icon">🧩</span><span>CBB模块</span>
+    </div>
+    <div class="nav-item" data-page="history">
+      <span class="icon">📜</span><span>审核记录</span>
+    </div>
+    <div class="nav-item admin-only" data-page="import">
+      <span class="icon">📥</span><span>货盘导入</span>
+    </div>
+    <div style="flex:1"></div>
+    <div id="llm-status" style="padding:0 24px;font-size:12px;color:var(--text3)">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <span class="spinner"></span> 检测LLM...
+      </div>
+    </div>
+    <div id="user-info" style="padding:12px 24px;border-top:1px solid var(--border);margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="user-avatar" id="user-avatar">👤</span>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" id="user-display-name">-</div>
+          <div style="font-size:11px;color:var(--text3)" id="user-role-label">-</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="doLogout()" title="退出登录" style="padding:4px 8px;font-size:11px">退出</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== Main Content ========== -->
+  <div class="main">
+
+    <!-- ====== Dashboard ====== -->
+    <div class="page active" id="page-dashboard">
+      <h2 class="page-title">📊 仪表盘</h2>
+      <div class="stat-grid" id="dash-stats"></div>
+      <div class="card">
+        <div class="card-title">📦 产品品类分布</div>
+        <div id="category-chart"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">📜 最近审核记录</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>文件名</th><th>审核类型</th><th>综合评分</th><th>风险等级</th><th>耗时</th><th>状态</th><th>时间</th></tr></thead>
+            <tbody id="dash-reviews"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====== Review ====== -->
+    <div class="page" id="page-review">
+      <h2 class="page-title">🔍 项目审核</h2>
+
+      <div class="card">
+        <div class="card-title">步骤一：选择审核类型</div>
+        <div class="task-grid" id="task-types">
+          <div class="task-card" data-type="hot_upgrade">
+            <div class="emoji">🔥</div>
+            <div class="name">爆品升级</div>
+            <div class="desc">针对已有爆款产品进行升级迭代审核</div>
+          </div>
+          <div class="task-card" data-type="competitor_upgrade">
+            <div class="emoji">⚔️</div>
+            <div class="name">竞品升级</div>
+            <div class="desc">基于竞品分析的产品升级审核</div>
+          </div>
+          <div class="task-card" data-type="low_sale_iterate">
+            <div class="emoji">📉</div>
+            <div class="name">未起量迭代</div>
+            <div class="desc">针对未起量产品进行迭代改进审核</div>
+          </div>
+          <div class="task-card" data-type="category_gap">
+            <div class="emoji">🗺️</div>
+            <div class="name">品类地图缺失</div>
+            <div class="desc">填补品类地图空缺的新品审核</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="review-upload-card" style="display:none">
+        <div class="card-title">步骤二：上传项目书（Excel）</div>
+        <div class="upload-area" id="review-upload">
+          <div class="icon">📁</div>
+          <p>拖拽 Excel 文件到此处，或点击选择文件</p>
+          <div class="hint">支持 .xlsx 格式，最大 50MB</div>
+          <input type="file" id="review-file" accept=".xlsx,.xls" style="display:none">
+        </div>
+        <div id="review-selected" style="margin-top:16px;display:none">
+          <div style="display:flex;align-items:center;gap:12px">
+            <span>📄</span>
+            <span id="review-filename" style="color:var(--text2)"></span>
+            <button class="btn btn-primary btn-sm" id="review-start-btn">开始审核</button>
+            <button class="btn btn-secondary btn-sm" onclick="cancelReview()">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="review-progress-card" style="display:none">
+        <div class="card-title">审核进行中...</div>
+        <div style="text-align:center;padding:40px">
+          <div class="spinner" style="width:40px;height:40px;border-width:3px;margin-bottom:16px"></div>
+          <p style="color:var(--text2)">正在执行审核 Pipeline，预计 3-5分钟...</p>
+          <p class="review-progress-text">Excel解析 → 图片提取 → 公共分析 → 专项分析 → 报告生成</p>
+        </div>
+      </div>
+
+      <div class="card" id="review-result-card" style="display:none">
+        <div class="card-title">✅ 审核完成</div>
+        <div id="review-result-content"></div>
+      </div>
+    </div>
+
+    <!-- ====== Products ====== -->
+    <div class="page" id="page-products">
+      <h2 class="page-title">📦 产品库</h2>
+      <div class="stat-grid" id="product-stats"></div>
+      <div class="card">
+        <div class="card-title">产品列表</div>
+        <div class="product-filters">
+          <select class="btn btn-secondary btn-sm" id="product-brand-filter" onchange="loadProducts(1)">
+            <option value="">全部品牌</option>
+            <option value="TMT">TMT</option>
+            <option value="SERUNA">SERUNA</option>
+            <option value="JAFFICK">JAFFICK</option>
+            <option value="ANTA">ANTA</option>
+          </select>
+          <select class="btn btn-secondary btn-sm" id="product-status-filter" onchange="loadProducts(1)">
+            <option value="">全部状态</option>
+            <option value="active">活跃</option>
+            <option value="archived">归档</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>货号</th><th>品牌</th><th>一级品类</th><th>二级品类</th><th>三级品类</th><th>版本</th><th>状态</th></tr></thead>
+            <tbody id="product-table"></tbody>
+          </table>
+        </div>
+        <div id="product-pagination" class="pagination"></div>
+      </div>
+    </div>
+
+    <!-- ====== CBB ====== -->
+    <div class="page" id="page-cbb">
+      <h2 class="page-title">🧩 CBB模块库</h2>
+      <div class="stat-grid" id="cbb-stats-grid"></div>
+      <div class="card">
+        <div class="card-title">模块列表</div>
+        <div class="cbb-filters">
+          <select class="btn btn-secondary btn-sm" id="cbb-category-filter" onchange="loadCBB(1)">
+            <option value="">全部类别</option>
+          </select>
+          <input type="text" id="cbb-search" class="cbb-search-input" placeholder="搜索模块编号或名称..." onkeyup="if(event.key==='Enter')loadCBB(1)">
+          <button class="btn btn-secondary btn-sm" onclick="loadCBB(1)">搜索</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模块编号</th><th>模块名称</th><th>类别</th><th>子类型</th><th>规格</th><th>供应商</th><th>价格</th><th>引用次数</th></tr></thead>
+            <tbody id="cbb-table"></tbody>
+          </table>
+        </div>
+        <div id="cbb-pagination" class="pagination"></div>
+      </div>
+    </div>
+
+    <!-- ====== History ====== -->
+    <div class="page" id="page-history">
+      <h2 class="page-title">📜 审核记录</h2>
+      <div class="card">
+        <div class="history-filters">
+          <select class="btn btn-secondary btn-sm" id="history-status-filter" onchange="loadHistory(1)">
+            <option value="">全部状态</option>
+            <option value="completed">已完成</option>
+            <option value="processing">进行中</option>
+            <option value="error">失败</option>
+          </select>
+          <select class="btn btn-secondary btn-sm" id="history-type-filter" onchange="loadHistory(1)">
+            <option value="">全部类型</option>
+            <option value="hot_upgrade">🔥 爆品升级</option>
+            <option value="competitor_upgrade">⚔️ 竞品升级</option>
+            <option value="low_sale_iterate">📉 未起量迭代</option>
+            <option value="category_gap">🗺️ 品类地图缺失</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>文件名</th><th>审核类型</th><th>综合评分</th><th>风险等级</th><th>耗时</th><th>状态</th><th>操作</th><th>时间</th></tr></thead>
+            <tbody id="history-table"></tbody>
+          </table>
+        </div>
+        <div id="history-pagination" class="pagination"></div>
+      </div>
+    </div>
+
+    <!-- ====== Import ====== -->
+    <div class="page" id="page-import">
+      <h2 class="page-title">📥 货盘导入</h2>
+      <div class="card">
+        <div class="card-title">上传货盘表</div>
+        <p style="color:var(--text3);font-size:13px;margin-bottom:16px">导入公司月度货盘 Excel，自动解析产品信息、销量数据并写入产品库。<br><span style="color:var(--orange)">⚠️ 仅超级管理员可执行导入操作</span></p>
+        <div class="form-row" style="margin-bottom:16px">
+          <div class="form-group">
+            <label>Sheet 名称（可选，默认最后一个数据sheet）</label>
+            <input type="text" id="import-sheet" placeholder="如：2026.03">
+          </div>
+          <div class="form-group">
+            <label>月份（可选，默认从sheet名推断）</label>
+            <input type="text" id="import-month" placeholder="如：2026-03">
+          </div>
+        </div>
+        <div class="upload-area" id="import-upload">
+          <div class="icon">📥</div>
+          <p>拖拽货盘 Excel 到此处，或点击选择</p>
+          <div class="hint">支持 .xlsx 格式的月度货盘表</div>
+          <input type="file" id="import-file" accept=".xlsx,.xls" style="display:none">
+        </div>
+        <div id="import-selected" style="margin-top:16px;display:none">
+          <div style="display:flex;align-items:center;gap:12px">
+            <span>📄</span>
+            <span id="import-filename" style="color:var(--text2)"></span>
+            <button class="btn btn-primary btn-sm" id="import-start-btn">开始导入</button>
+            <button class="btn btn-secondary btn-sm" onclick="cancelImport()">取消</button>
+          </div>
+        </div>
+        <div id="import-result" class="import-result" style="display:none"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Modal for report -->
+<div class="modal-overlay" id="report-modal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<!-- JS: API first, then modules, then app entry -->
+<script src="/static/js/api.js"></script>
+<script src="/static/js/auth.js"></script>
+<script src="/static/js/dashboard.js"></script>
+<script src="/static/js/review.js"></script>
+<script src="/static/js/products.js"></script>
+<script src="/static/js/cbb.js"></script>
+<script src="/static/js/history.js"></script>
+<script src="/static/js/import.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

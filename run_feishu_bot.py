@@ -9,11 +9,10 @@
     1. 在飞书开放平台创建应用，开启机器人能力
     2. 事件订阅选择"使用长连接接收事件"
     3. 添加事件: im.message.receive_v1
-    4. 配置环境变量（可选，已有默认值）:
-       - FEISHU_APP_ID
-       - FEISHU_APP_SECRET
+    4. 配置 .env 文件:
        - LLM_API_KEY (用于AI评分)
-       - LLM_PROVIDER (默认: siliconflow)
+       - LLM_MODEL (文本模型，默认 Qwen/Qwen2.5-7B-Instruct)
+       - LLM_VL_MODEL (视觉模型，默认 Qwen/Qwen3-VL-8B-Instruct)
 """
 
 import io
@@ -64,9 +63,9 @@ def main():
     # 检查LLM配置
     llm_key = os.getenv("LLM_API_KEY", "")
     if llm_key:
-        provider = os.getenv("LLM_PROVIDER", "siliconflow")
-        model = os.getenv("LLM_MODEL", "auto")
-        logger.info(f"LLM配置: provider={provider}, model={model}")
+        model = os.getenv("LLM_MODEL", "unknown")
+        vl_model = os.getenv("LLM_VL_MODEL", "unknown")
+        logger.info(f"LLM配置: model={model}, vl_model={vl_model}")
     else:
         logger.warning("LLM_API_KEY 未设置，将使用规则引擎回退模式")
         logger.warning("如需AI评分，请设置环境变量: LLM_API_KEY")
