@@ -78,7 +78,7 @@ def build_task_selection_card() -> dict:
 
 
 def build_task_selected_card(task_label: str, task_emoji: str) -> dict:
-    """构建任务选择确认卡片"""
+    """构建任务选择确认卡片（含更换按钮）"""
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -99,6 +99,17 @@ def build_task_selected_card(task_label: str, task_emoji: str) -> dict:
                         f"⏳ 选择5分钟内有效，超时需重新选择。"
                     ),
                 },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "🔄 更换任务类型"},
+                        "type": "default",
+                        "value": {"action": "change_task"},
+                    },
+                ],
             },
         ],
     }

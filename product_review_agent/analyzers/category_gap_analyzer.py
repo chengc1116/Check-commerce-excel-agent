@@ -5,17 +5,19 @@
 流程：
   1. 检查我方品牌在该品类下是否已有产品
   2. 如果有，列出已有产品+模块（属于品类补全，非全新空白）
-  3. 如果没有，属于真正的品类空白
+  3. 如果没有，区分"完全品类缺失"和"半品类缺失"
+     - 完全品类缺失：整个品类没有任何品牌有产品
+     - 半品类缺失：别的品牌有产品，但我方品牌没有
   4. 获取品类市场概况（品牌分布、销量排行）
   5. 用VL模型拆解竞品/参考图片→模块清单
   6. 基于现有CBB模块库，给出模块组合建议（尽量复用）
   7. 评估市场空白风险和机会
 
 量化打分（100分制）：
-  - 市场机会 (30分): 品类缺失程度+竞品验证+市场容量
-  - 模块复用度 (25分): 可复用模块比例
-  - 进入门槛 (25分): 需新建模块数量+供应链难度
-  - 风险评估 (20分): 市场接受度+竞争格局
+  - 市场机会 (35分): 品类缺失程度+竞品验证+市场容量
+  - 模块复用度 (25分): 区分完全/半品类缺失，可复用模块比例
+  - 进入门槛 (25分): 需新建模块数量+面料/版型权重+供应链难度
+  - 价格竞争力 (15分): 我方定价与竞品定价的偏差率+毛利率
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from product_review_agent.analyzers.module_vision import (
     compare_module_sets,
     build_module_table,
     build_product_module_summary,
+    ProductCategoryInfo,
 )
 from product_review_agent.analyzers.base import (
     BaseAnalyzer,
@@ -54,10 +57,10 @@ class CategoryGapAnalyzer(BaseAnalyzer):
     emoji = "🗺️"
 
     SCORING_DIMENSIONS = [
-        ("市场机会", 30, "品类缺失程度+竞品验证+市场容量"),
-        ("模块复用度", 25, "可复用模块比例"),
-        ("进入门槛", 25, "需新建模块数量+供应链难度"),
-        ("风险评估", 20, "市场接受度+竞争格局"),
+        ("市场机会", 35, "品类缺失程度+竞品验证+市场容量"),
+        ("模块复用度", 25, "区分完全/半品类缺失，可复用模块比例"),
+        ("进入门槛", 25, "需新建模块+面料/版型权重+供应链难度"),
+        ("价格竞争力", 15, "我方定价与竞品偏差率+毛利率"),
     ]
 
     async def analyze(self, project_data: dict, images: list = None) -> dict:
@@ -161,8 +164,12 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         if images and llm.is_available:
             vision_result = await vision_decompose_multiple(
                 llm, images,
-                category=f"{category_l2} > {category_l3}",
-                product_name=competitor_name or product_name,
+                category_info=ProductCategoryInfo(
+                    category_l1=category_l1,
+                    category_l2=category_l2,
+                    category_l3=category_l3,
+                    product_name=competitor_name or product_name,
+                ),
             )
             if vision_result.get("modules"):
                 competitor_info["modules"] = vision_result["modules"]
@@ -236,73 +243,232 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         market_overview = analysis_result.get("market_overview", {})
         category_sales_summary = analysis_result.get("category_sales_summary", {})
 
-        # 维度1: 市场机会 (30分)
+        # ── 判断缺失类型 ──
+        # full_gap:  完全品类缺失（整个品类没有任何品牌有产品）
+        # half_gap:  半品类缺失（别的品牌有产品，但我方品牌没有）
+        # no_gap:    同品牌下已有产品（品类补全）
         has_gap = gap_info.get("has_gap", True)
-        if has_gap:
-            market_score = 22
-            market_reason = "全新品类空白，市场机会大"
+        brand_dist = market_overview.get("brand_distribution", [])
+        other_brands_exist = len(brand_dist) > 0  # 品类下有其他品牌的产品
+
+        if has_gap and not other_brands_exist:
+            gap_type = "full_gap"
+            gap_type_desc = "完全品类缺失"
+        elif has_gap and other_brands_exist:
+            gap_type = "half_gap"
+            gap_type_desc = "半品类缺失"
         else:
-            market_score = 14
-            market_reason = f"品类补全，已有{len(existing_products)}个产品"
+            gap_type = "no_gap"
+            gap_type_desc = "品类补全"
+
+        # ── 维度1: 市场机会 (35分) ──
+        if gap_type == "full_gap":
+            market_score = 20
+            market_reason = "完全品类空白，市场未被验证，机会与风险并存"
+        elif gap_type == "half_gap":
+            market_score = 25
+            market_reason = f"半品类缺失，{len(brand_dist)}个品牌已有产品，市场已被验证"
+        else:
+            market_score = 10
+            market_reason = f"品类补全，已有{len(existing_products)}个同品牌产品"
 
         # 有竞品参考说明市场已被验证
         competitor_modules = analysis_result.get("competitor_product", {}).get("modules", [])
         if competitor_modules:
-            market_score = min(30, market_score + 5)
+            market_score = min(35, market_score + 5)
             market_reason += "，竞品验证市场存在"
 
         # 品类总销量越大市场越成熟
         total_sales = category_sales_summary.get("total_sales", 0)
         if total_sales >= 50000:
-            market_score = min(30, market_score + 3)
+            market_score = min(35, market_score + 3)
             market_reason += f"，品类月均总销量{total_sales//6}+，市场成熟"
         elif total_sales >= 10000:
-            market_score = min(30, market_score + 1)
-            market_reason += f"，品类有一定市场基础"
+            market_score = min(35, market_score + 1)
+            market_reason += "，品类有一定市场基础"
 
-        # 维度2: 模块复用度 (25分)
-        reuse_s, reuse_r = calc_reuse_score(summary, max_score=25)
-
-        # 维度3: 进入门槛 (25分) — 需新建越少门槛越低
-        new_count = len(summary.get("new_modules_needed", []))
+        # ── 维度2: 模块复用度 (25分) ──
+        # 区分完全/半品类缺失，逻辑不同
         reuse_count = len(summary.get("reuse_modules", []))
-        total_ops = new_count + reuse_count
+        new_count = len(summary.get("new_modules_needed", []))
+        total_ops = reuse_count + new_count
+
+        if gap_type == "full_gap":
+            # 完全品类缺失：之前从未做过这个产品
+            if total_ops == 0:
+                # 无任何模块数据
+                if not competitor_modules:
+                    # 完全找不到类似品，直接低分
+                    reuse_score = 5
+                    reuse_reason = "完全品类缺失，无类似品参考，模块复用极低"
+                else:
+                    # 有竞品拆解数据但无复用/新建分类，给中等偏低分
+                    reuse_score = 10
+                    reuse_reason = "完全品类缺失，有竞品参考但复用数据不完整"
+            else:
+                reuse_ratio = reuse_count / total_ops
+                if reuse_ratio >= 0.5:
+                    # 工厂有该品类的模块，可以复用
+                    reuse_score = 18
+                    reuse_reason = f"完全品类缺失，但工厂有可复用模块，复用{reuse_count}个/新建{new_count}个"
+                else:
+                    # 复用率低
+                    reuse_score = max(3, int(25 * reuse_ratio * 0.6))
+                    reuse_reason = f"完全品类缺失，复用率{reuse_ratio:.0%}，基础薄弱"
+
+        elif gap_type == "half_gap":
+            # 半品类缺失：公司其他品牌有产品，正常计算复用率
+            if total_ops == 0:
+                reuse_score = 12
+                reuse_reason = "半品类缺失，无复用/新建模块数据"
+            else:
+                reuse_ratio = reuse_count / total_ops
+                reuse_score = max(0, int(25 * reuse_ratio))
+                reuse_reason = f"半品类缺失，可复用{reuse_count}个，需新建{new_count}个，复用率{reuse_ratio:.0%}"
+
+        else:
+            # 品类补全：同品牌下有产品，正常计算
+            if total_ops == 0:
+                reuse_score = 12
+                reuse_reason = "无复用/新建模块数据"
+            else:
+                reuse_ratio = reuse_count / total_ops
+                reuse_score = max(0, int(25 * reuse_ratio))
+                reuse_reason = f"可复用{reuse_count}个，需新建{new_count}个，复用率{reuse_ratio:.0%}"
+
+        # ── 维度3: 进入门槛 (25分) ──
+        # 面料/版型模块权重更高（系数1.5），其他模块权重1.0
+        FABRIC_PATTERN_KEYWORDS = {"面料", "版型", "布料", "材质", "织物", "内衬", "外层", "包布"}
+
         if total_ops > 0:
-            new_ratio = new_count / total_ops
-            entry_score = max(5, int(25 * (1 - new_ratio * 0.7)))
-            entry_reason = f"需新建{new_count}项，复用{reuse_count}项，新建比{new_ratio:.0%}"
+            # 区分模块类型计算加权新建占比
+            weighted_new = 0.0
+            weighted_total = 0.0
+            new_modules = summary.get("new_modules_needed", [])
+            reuse_modules = summary.get("reuse_modules", [])
+
+            for m in new_modules:
+                m_str = str(m).lower()
+                is_fabric = any(kw in m_str for kw in FABRIC_PATTERN_KEYWORDS)
+                weight = 1.5 if is_fabric else 1.0
+                weighted_new += weight
+                weighted_total += weight
+
+            for m in reuse_modules:
+                m_str = str(m).lower()
+                is_fabric = any(kw in m_str for kw in FABRIC_PATTERN_KEYWORDS)
+                weight = 1.5 if is_fabric else 1.0
+                weighted_total += weight
+
+            if weighted_total > 0:
+                weighted_new_ratio = weighted_new / weighted_total
+            else:
+                weighted_new_ratio = new_count / total_ops
+
+            entry_score = max(5, int(25 * (1 - weighted_new_ratio * 0.7)))
+            entry_reason = f"需新建{new_count}项，复用{reuse_count}项，加权新建比{weighted_new_ratio:.0%}"
         else:
             entry_score = 10
             entry_reason = "无模块操作数据"
 
-        # 维度4: 风险评估 (20分)
-        risk_factors = summary.get("risk_factors", [])
-        if risk_factors:
-            risk_count = len(risk_factors)
-            if risk_count <= 1:
-                risk_score = 16
-            elif risk_count <= 3:
-                risk_score = 12
-            else:
-                risk_score = 6
-            risk_reason = f"识别到{risk_count}个风险因素"
+        # 特殊说明：工厂有相关产品可做
+        factory_note = summary.get("factory_capability", "") or ""
+        project_data_brand = analysis_result.get("gap_info", {}).get("brand", "")
+        if factory_note or (gap_type == "full_gap" and reuse_count > 0):
+            entry_score = min(25, entry_score + 3)
+            entry_reason += "，工厂有相关产品可做"
+
+        # ── 维度4: 价格竞争力 (15分) ──
+        # 从项目数据中取定价和成本
+        # 注意：analysis_result 不直接包含 project_data，需从 gap_info 或其他途径获取
+        # 这里从 summary 中尝试获取（LLM 可能输出价格信息）
+        pricing = summary.get("pricing", 0) or 0
+        erp_price = summary.get("erp_price", 0) or 0
+        competitor_price = summary.get("competitor_price", 0) or 0
+
+        # 尝试从 module_comparison 中提取竞品价格信息
+        if not competitor_price:
+            for mc in module_comparison:
+                cp = mc.get("competitor_price")
+                if cp:
+                    try:
+                        competitor_price = float(str(cp).replace("元", "").replace("￥", "").strip())
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        if pricing and competitor_price:
+            # 两边都有价格，可以计算偏差率
+            try:
+                our_price = float(str(pricing).replace("元", "").replace("￥", "").strip())
+                comp_price = float(str(competitor_price).replace("元", "").replace("￥", "").strip())
+
+                if comp_price > 0:
+                    deviation = (our_price - comp_price) / comp_price
+
+                    # 基于偏差率评分
+                    if -0.10 <= deviation <= 0.10:
+                        price_score = 15  # 价格接近，竞争力强
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，价格接近"
+                    elif -0.20 <= deviation < -0.10:
+                        price_score = 12  # 略低于竞品，性价比路线
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，略低于竞品"
+                    elif 0.10 < deviation <= 0.20:
+                        price_score = 10  # 略高于竞品，需差异化支撑
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，略高于竞品"
+                    elif -0.30 <= deviation < -0.20:
+                        price_score = 8  # 偏低较多
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，偏低较多"
+                    elif 0.20 < deviation <= 0.30:
+                        price_score = 6  # 偏高较多
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，偏高较多"
+                    elif deviation > 0.30:
+                        price_score = 3  # 过高
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，价格过高"
+                    else:
+                        price_score = 5  # 过低
+                        price_reason = f"定价{our_price:.0f}元 vs 竞品{comp_price:.0f}元，偏差{deviation:+.1%}，价格过低"
+
+                    # 毛利空间修正
+                    if erp_price and our_price > 0:
+                        try:
+                            erp_val = float(str(erp_price).replace("元", "").replace("￥", "").strip())
+                            margin = (our_price - erp_val) / our_price
+                            if margin < 0.20:
+                                price_score = max(3, price_score - 3)
+                                price_reason += f"，毛利率{margin:.0%}偏低"
+                            elif margin < 0.40:
+                                price_score = max(3, price_score - 1)
+                                price_reason += f"，毛利率{margin:.0%}偏紧"
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    price_score = 8
+                    price_reason = "竞品价格数据异常"
+
+            except (ValueError, TypeError):
+                price_score = 8
+                price_reason = "价格数据格式异常"
+
+        elif pricing and not competitor_price:
+            # 有我方定价，无竞品价格
+            price_score = 8
+            price_reason = f"有定价{pricing}，但无竞品价格参考"
+        elif not pricing and competitor_price:
+            # 有竞品价格，无我方定价
+            price_score = 6
+            price_reason = f"竞品价格{competitor_price}，但我方未定价"
         else:
-            risk_score = 15
-            risk_reason = "未识别到明显风险"
+            # 两者都没有
+            price_score = 5
+            price_reason = "价格信息缺失，无法评估"
 
-        # 竞争格局影响风险
-        brand_dist = market_overview.get("brand_distribution", [])
-        if len(brand_dist) >= 3:
-            risk_score = max(5, risk_score - 3)
-            risk_reason += "，品类内品牌竞争较激烈"
-        elif len(brand_dist) == 1:
-            risk_reason += "，品类品牌集中度低"
-
+        # ── 汇总 ──
         dimensions = [
-            DimensionScore("市场机会", market_score, 30, market_reason),
-            DimensionScore("模块复用度", reuse_s, 25, reuse_r),
+            DimensionScore("市场机会", market_score, 35, market_reason),
+            DimensionScore("模块复用度", reuse_score, 25, reuse_reason),
             DimensionScore("进入门槛", entry_score, 25, entry_reason),
-            DimensionScore("风险评估", risk_score, 20, risk_reason),
+            DimensionScore("价格竞争力", price_score, 15, price_reason),
         ]
 
         total = sum(d.score for d in dimensions)
@@ -310,12 +476,17 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         weaknesses = summary.get("our_weaknesses", [])
 
         suggestions = []
-        if reuse_s < 15:
-            suggestions.append("模块复用率偏低，建议优先评估现有CBB模块的适配可能性")
+        if market_score < 20:
+            suggestions.append("市场机会偏小，建议重新评估品类进入的必要性")
+        if reuse_score < 10:
+            if gap_type == "full_gap":
+                suggestions.append("完全品类缺失且复用基础薄弱，建议先小批量试产验证供应链能力")
+            else:
+                suggestions.append("模块复用率偏低，建议优先评估现有CBB模块的适配可能性")
         if entry_score < 15:
             suggestions.append("进入门槛较高，建议分阶段进入：先复用再创新")
-        if risk_score < 10:
-            suggestions.append("风险因素较多，建议小批量试产验证市场接受度")
+        if price_score < 8:
+            suggestions.append("价格竞争力不足，建议调整定价策略或增加差异化卖点支撑溢价")
         if has_gap and total_sales > 0:
             suggestions.append(f"品类已有{total_sales}总销量验证，建议参考头部产品模块组合快速切入")
 
@@ -346,7 +517,18 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 
         # 品类缺失信息
         gap_info = analysis_result.get("gap_info", {})
-        gap_type = "🆕 全新品类空白" if gap_info.get("has_gap") else "📦 品类补全"
+        # 判断缺失类型
+        market_overview_rpt = analysis_result.get("market_overview", {})
+        brand_dist_rpt = market_overview_rpt.get("brand_distribution", [])
+        has_gap_rpt = gap_info.get("has_gap", True)
+        other_brands_rpt = len(brand_dist_rpt) > 0
+
+        if has_gap_rpt and not other_brands_rpt:
+            gap_type = "🆕 完全品类缺失（品类下无任何品牌产品）"
+        elif has_gap_rpt and other_brands_rpt:
+            gap_type = "🔲 半品类缺失（其他品牌有，我方品牌没有）"
+        else:
+            gap_type = "📦 品类补全（同品牌下已有产品）"
         lines.append(f"  缺失类型: {gap_type}")
         lines.append(f"  {gap_info.get('gap_description', '')}")
 
@@ -428,10 +610,8 @@ class CategoryGapAnalyzer(BaseAnalyzer):
                 lines.append("  需新建模块:")
                 for m in summary["new_modules_needed"]:
                     lines.append(f"    🆕 {m}")
-            if summary.get("risk_factors"):
-                lines.append("  风险因素:")
-                for r in summary["risk_factors"]:
-                    lines.append(f"    ⚠️ {r}")
+            if summary.get("price_competitiveness"):
+                lines.append(f"  价格竞争力: {summary['price_competitiveness']}")
             if summary.get("overall_assessment"):
                 lines.append(f"  整体评价: {summary['overall_assessment']}")
 

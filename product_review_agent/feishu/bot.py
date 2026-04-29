@@ -84,7 +84,13 @@ def _patch_ws_client_card_handler():
     _patch_logger = logging.getLogger(__name__)
 
     async def _patched_handle_data_frame(self, frame):
-        """修复版: CARD 类型消息也会分发给 event_handler"""
+        """修复版: CARD 类型消息也会分发给 event_handler
+        
+        关键修改：
+        1. CARD 消息分发给 event_handler（原版直接 return 丢弃）
+        2. CARD 响应不往 WebSocket 回写 result data（飞书服务端不期望收到）
+           只回写一个空的 OK 响应即可
+        """
         hs = frame.headers
         msg_id = _get_by_key(hs, HEADER_MESSAGE_ID)
         trace_id = _get_by_key(hs, HEADER_TRACE_ID)
@@ -111,11 +117,12 @@ def _patch_ws_client_card_handler():
                 result = self._event_handler.do_without_validation(pl)
             elif message_type == MessageType.CARD:
                 # 🔧 修复: 原版直接 return 丢弃卡片回调
-                # 改为: 同 EVENT 一样分发给 event_handler
+                # 改为: 分发给 event_handler 处理业务逻辑
                 if self._event_handler:
-                    result = self._event_handler.do_without_validation(pl)
-                else:
-                    result = None
+                    self._event_handler.do_without_validation(pl)
+                # ⚠️ 关键: CARD 回调不往 resp.data 写 result
+                # 飞书服务端对 CARD 类型不期望收到序列化的响应数据
+                # 写了会导致 200672 错误
                 _patch_logger.info(f"[WS] 卡片回调已处理: msg_id={msg_id}")
             else:
                 return
@@ -123,7 +130,8 @@ def _patch_ws_client_card_handler():
             header = hs.add()
             header.key = HEADER_BIZ_RT
             header.value = str(end - start)
-            if result is not None:
+            if message_type == MessageType.EVENT and result is not None:
+                # 只有 EVENT 类型才回写 result data
                 resp.data = base64.b64encode(JSON.marshal(result).encode(UTF_8))
         except Exception as e:
             _patch_logger.error(
@@ -138,7 +146,7 @@ def _patch_ws_client_card_handler():
 
     # 应用补丁
     lark.ws.Client._handle_data_frame = _patched_handle_data_frame
-    _patch_logger.info("Monkey patch 已应用: lark.ws.Client._handle_data_frame (修复卡片回调)")
+    _patch_logger.info("Monkey patch 已应用: lark.ws.Client._handle_data_frame (修复卡片回调，不回写data)")
 
 # 应用补丁（模块加载时立即生效）
 _patch_ws_client_card_handler()
@@ -254,6 +262,7 @@ def _upload_file_to_feishu(client: lark.Client, file_path: str) -> Optional[str]
     上传文件到飞书，返回 file_key。
 
     使用 im/v1/files 接口上传（适用于消息中发送文件）。
+    file 参数需要传入 IO 对象（文件句柄），且在请求完成前保持打开。
     """
     try:
         from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
@@ -261,19 +270,18 @@ def _upload_file_to_feishu(client: lark.Client, file_path: str) -> Optional[str]
         file_name = os.path.basename(file_path)
 
         with open(file_path, "rb") as f:
-            file_data = f.read()
-
-        request = CreateFileRequest.builder() \
-            .request_body(
-                CreateFileRequestBody.builder()
-                .file_type("stream")
-                .file_name(file_name)
-                .file(file_data)
+            body = CreateFileRequestBody.builder() \
+                .file_type("stream") \
+                .file_name(file_name) \
+                .file(f) \
                 .build()
-            ) \
-            .build()
 
-        response = client.im.v1.file.create(request)
+            request = CreateFileRequest.builder() \
+                .request_body(body) \
+                .build()
+
+            response = client.im.v1.file.create(request)
+
         if response.success():
             file_key = response.data.file_key
             logger.info(f"文件上传成功: file_key={file_key}, name={file_name}")
@@ -416,15 +424,6 @@ def _run_review_in_thread(
             logger.warning(f"[{tname}] reply 失败，改用 send_card_to_chat")
             send_card_to_chat(worker_client, chat_id, result_card)
 
-        # 发送完整审核报告（文本消息）
-        if result.report:
-            report_text = result.report
-            chunk_size = 3000
-            for i in range(0, len(report_text), chunk_size):
-                chunk = report_text[i:i + chunk_size]
-                reply_text_message(worker_client, message_id, chunk)
-            logger.info(f"[{tname}] 完整报告已发送")
-
         # Step 4: 生成并发送 Word 审核报告
         logger.info(f"[{tname}] Step 4/4: 生成 Word 报告...")
         try:
@@ -469,7 +468,12 @@ def _run_review_in_thread(
                 _send_file_message(worker_client, chat_id, file_key, os.path.basename(docx_path))
                 logger.info(f"[{tname}] Word 报告已发送到飞书")
             else:
-                logger.warning(f"[{tname}] Word 报告上传失败，跳过发送")
+                logger.warning(f"[{tname}] Word 报告上传失败，改发文本摘要")
+                # 降级：上传失败时发送简短文本
+                reply_text_message(
+                    worker_client, message_id,
+                    f"Word报告上传失败，综合评分: {result.overall_score}/100，风险等级: {result.risk_level}"
+                )
 
             # 清理临时文件
             try:
@@ -479,6 +483,14 @@ def _run_review_in_thread(
 
         except Exception as e:
             logger.error(f"[{tname}] 生成/发送 Word 报告失败: {e}", exc_info=True)
+            # 降级：发送简短文本摘要
+            try:
+                reply_text_message(
+                    worker_client, message_id,
+                    f"报告生成失败，综合评分: {result.overall_score}/100，风险等级: {result.risk_level}"
+                )
+            except Exception:
+                pass
 
         logger.info(f"[{tname}] ========== 审核线程完成 ==========")
 
@@ -529,13 +541,18 @@ def on_message_receive(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 # 检查用户是否已选择了任务
                 session = session_manager.get_or_create(user_id, chat_id)
                 if session.is_waiting_file:
-                    # 已选择任务，提示继续上传
+                    # 已选择任务，重新弹出选择卡片（允许更换）
                     task = session.task_type
-                    reply_text_message(
-                        client, message_id,
-                        f"您已选择 {task.emoji} {task.label}，请直接上传Excel文件即可。\n"
-                        f"如需更换任务类型，请发送任意消息重新选择。"
-                    )
+                    card = build_task_selection_card()
+                    # 在卡片前加一段提示，告诉用户当前选择
+                    try:
+                        reply_text_message(
+                            client, message_id,
+                            f"当前已选择 {task.emoji} {task.label}，请重新选择或直接上传Excel文件："
+                        )
+                    except Exception:
+                        pass
+                    reply_card_message(client, message_id, card)
                 else:
                     # 弹出任务选择卡片
                     card = build_task_selection_card()
@@ -583,7 +600,7 @@ def on_message_receive(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             client, message_id,
             f"{task_type.emoji} {task_type.label} 审核\n"
             f"文件已接收: {file_name}\n"
-            f"正在分析中，预计需要 1-2 分钟，请稍候...\n"
+            f"正在分析中，预计需要 3-5 分钟，请稍候...\n"
             f"分析完成后会自动推送审核报告。"
         )
 
@@ -608,19 +625,13 @@ def on_card_action_trigger(data) -> dict:
     用户点击任务选择按钮时触发。
     通过 EventDispatcherHandler.register_p2_card_action_trigger 注册。
     
-    data 类型: P2CardActionTrigger
-      - data.event.action.value: 按钮的 value (Dict)
-      - data.event.operator.open_id: 操作用户 ID
-      - data.event.context.open_chat_id: 聊天 ID
+    支持两种动作:
+    - task_type=xxx: 选择任务类型
+    - action=change_task: 更换任务类型（重新弹出选择卡片）
     
-    返回 P2CardActionTriggerResponse 可更新卡片内容 + 弹 toast。
+    注意：长连接模式下，回调返回值无法直接更新卡片（会触发 200672 错误），
+    因此改用主动发消息的方式确认用户选择。
     """
-    from lark_oapi.event.callback.model.p2_card_action_trigger import (
-        P2CardActionTriggerResponse,
-        CallBackToast,
-        CallBackCard,
-    )
-
     try:
         # 从回调数据中提取 action 和用户信息
         action = data.event.action
@@ -630,7 +641,7 @@ def on_card_action_trigger(data) -> dict:
         user_id = operator.open_id if operator else ""
         chat_id = context.open_chat_id if context else ""
 
-        logger.info(f"卡片回调原始数据: action={action}, operator={operator}, context={context}")
+        logger.info(f"卡片回调: user={user_id}, chat={chat_id}")
 
         # 获取用户点击的按钮 value
         action_value = {}
@@ -645,6 +656,22 @@ def on_card_action_trigger(data) -> dict:
             else:
                 logger.warning(f"action.value 类型异常: {type(action.value)} = {action.value}")
 
+        # ---- 处理「更换任务类型」动作 ----
+        action_name = action_value.get("action", "")
+        if action_name == "change_task":
+            logger.info(f"卡片回调: user={user_id} 请求更换任务类型")
+            # 重置会话状态
+            session_manager.reset(user_id)
+            # 重新弹出任务选择卡片
+            try:
+                client = get_feishu_client()
+                selection_card = build_task_selection_card()
+                send_card_to_chat(client, chat_id, selection_card)
+            except Exception as e:
+                logger.warning(f"发送选择卡片失败: {e}，不影响主流程")
+            return {}
+
+        # ---- 处理「选择任务类型」动作 ----
         task_type_str = action_value.get("task_type", "")
         logger.info(f"卡片回调: user={user_id}, chat={chat_id}, task_type_str={task_type_str}")
 
@@ -652,32 +679,27 @@ def on_card_action_trigger(data) -> dict:
 
         if not task_type:
             logger.warning(f"未知的任务类型: {task_type_str}, 可选: {list(TASK_TYPE_MAP.keys())}")
-            resp = P2CardActionTriggerResponse()
-            resp.toast = CallBackToast({"type": "error", "content": f"未知的任务类型: {task_type_str}"})
-            return resp
+            return {}
 
         # 记录用户选择
         session_manager.set_task(user_id, task_type, chat_id, "")
         logger.info(f"卡片回调: user={user_id} 选择了 {task_type.label}")
 
-        # 返回确认：toast 提示 + 更新卡片内容
-        # CallBackCard 需要 {"type": "update", "data": card_dict} 格式
-        resp = P2CardActionTriggerResponse()
-        resp.toast = CallBackToast({
-            "type": "success",
-            "content": f"已选择 {task_type.emoji} {task_type.label}，请上传Excel文件"
-        })
-        resp.card = CallBackCard({
-            "type": "update",
-            "data": build_task_selected_card(task_type.label, task_type.emoji),
-        })
-        return resp
+        # 主动发送确认消息（不依赖回调返回值更新卡片，避免 200672 错误）
+        try:
+            client = get_feishu_client()
+            confirm_card = build_task_selected_card(task_type.label, task_type.emoji)
+            # 使用 chat_id 直接发送卡片消息
+            send_card_to_chat(client, chat_id, confirm_card)
+        except Exception as e:
+            logger.warning(f"发送确认卡片失败: {e}，不影响主流程")
+
+        # 返回空 dict，不触发 SDK 序列化响应
+        return {}
 
     except Exception as e:
         logger.error(f"处理卡片回调异常: {e}", exc_info=True)
-        resp = P2CardActionTriggerResponse()
-        resp.toast = CallBackToast({"type": "error", "content": "处理失败，请重试"})
-        return resp
+        return {}
 
 
 # ============================================================

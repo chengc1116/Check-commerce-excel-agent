@@ -31,6 +31,7 @@ from product_review_agent.analyzers.module_vision import (
     compare_module_sets,
     build_module_table,
     build_product_module_summary,
+    ProductCategoryInfo,
 )
 from product_review_agent.analyzers.base import (
     BaseAnalyzer,
@@ -64,6 +65,7 @@ class CompetitorUpgradeAnalyzer(BaseAnalyzer):
         llm = get_llm_client()
         category_l3 = project_data.get("category_l3") or project_data.get("categoryl3", "")
         category_l2 = project_data.get("category_l2") or project_data.get("categoryl2", "")
+        category_l1 = project_data.get("category_l1") or project_data.get("categoryl1", "")
         brand = project_data.get("brand", "")
         competitor_name = project_data.get("competitor_name", "")
         competitor_strengths_copy = project_data.get("competitor_strengths_copy", "")
@@ -136,8 +138,12 @@ class CompetitorUpgradeAnalyzer(BaseAnalyzer):
         if images and llm.is_available:
             vision_result = await vision_decompose_multiple(
                 llm, images,
-                category=f"{category_l2} > {category_l3}",
-                product_name=competitor_name,
+                category_info=ProductCategoryInfo(
+                    category_l1=category_l1,
+                    category_l2=category_l2,
+                    category_l3=category_l3,
+                    product_name=competitor_name,
+                ),
             )
             if vision_result.get("modules"):
                 competitor_info["modules"] = vision_result["modules"]

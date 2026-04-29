@@ -4,8 +4,10 @@ VL模型模块拆解 + 模块对比分析
 
 共享能力：
   1. vision_decompose: 用VL模型从图片中拆解模块清单
-  2. compare_module_sets: 用LLM对比两组模块，输出差距矩阵+升级建议
-  3. build_module_table: 将模块列表格式化为文本表格
+  2. vision_decompose_multiple: 多图拆解
+  3. match_category_by_rag: 向量库检索最相似产品的模块列表（骨架）
+  4. compare_module_sets: 用LLM对比两组模块，输出差距矩阵+升级建议
+  5. build_module_table: 将模块列表格式化为文本表格
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import base64
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Optional
 
 from product_review_agent.agents.llm_client import LLMClient, get_llm_client
@@ -22,101 +25,73 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 品类模块定义：按物理结构限定拆解范围
+# 品类信息参数
 # ============================================================
 
-CATEGORY_MODULES = {
-    "护膝": {
-        "modules": ["绑带", "面料", "支撑体", "减震垫", "内衬", "涂装/外观"],
-        "descriptions": {
-            "绑带": "固定+加压的带状结构（单绑带/双绑带/X型交叉/8字缠绕）",
-            "面料": "主体织物，承载整体（针织网眼/3D编织/莱卡混纺/竹炭纤维）",
-            "支撑体": "侧面刚性/半刚性支撑（弹簧条/铰链/硅胶条/TPU条/无）",
-            "减震垫": "髌骨/关节处的缓冲层（硅胶垫/EVA垫/凝胶垫/半透硅胶/无）",
-            "内衬": "贴肤层，影响舒适度（针织内衬/绒面/硅胶防滑点/无）",
-            "涂装/外观": "颜色、LOGO、装饰（纯色/渐变/反光条/印花）",
-        },
-        "user_perception": {
-            "绑带": "高", "面料": "高", "支撑体": "高",
-            "减震垫": "高", "内衬": "中", "涂装/外观": "低",
-        },
-    },
-    "髌骨带": {
-        "modules": ["绑带", "面料", "减震垫", "内衬", "固定系统", "涂装/外观"],
-        "descriptions": {
-            "绑带": "固定+加压的带状结构（单绑带/双绑带/上下双加压）",
-            "面料": "主体织物（针织网眼/轻薄锦纶/3D编织/SBR）",
-            "减震垫": "髌骨处的缓冲/按摩层（硅胶垫/分段式硅胶条/EVA垫/凝胶垫/无）",
-            "内衬": "贴肤层（涤纶网布/绒面/硅胶防滑点/无）",
-            "固定系统": "可调节固定结构（医疗级魔术贴/卡扣/无）",
-            "涂装/外观": "颜色、LOGO、装饰（纯色/渐变/品牌涂装）",
-        },
-        "user_perception": {
-            "绑带": "高", "面料": "高", "减震垫": "高",
-            "内衬": "中", "固定系统": "中", "涂装/外观": "低",
-        },
-    },
-    "护踝": {
-        "modules": ["绑带", "面料", "支撑条", "踝骨垫", "脚跟套", "内衬"],
-        "descriptions": {
-            "绑带": "固定+加压的带状结构（8字缠绕/X型交叉/单环绕/双层缠绕）",
-            "面料": "主体织物（针织网眼/3D编织/弹力布/竹炭纤维）",
-            "支撑条": "侧面刚性支撑（铝合金条/塑钢条/硅胶条/TPU条/无）",
-            "踝骨垫": "踝关节凸起处的保护垫（硅胶垫/EVA垫/凝胶垫/无）",
-            "脚跟套": "脚跟固定结构（开放式/半包式/全包式/无）",
-            "内衬": "贴肤层（针织内衬/绒面/硅胶防滑条/无）",
-        },
-        "user_perception": {
-            "绑带": "高", "面料": "高", "支撑条": "高",
-            "踝骨垫": "中", "脚跟套": "中", "内衬": "低",
-        },
-    },
-    "护腕": {
-        "modules": ["绑带", "面料", "支撑条", "拇指固定环", "加压垫"],
-        "descriptions": {
-            "绑带": "固定+加压的带状结构（单绑带/双绑带/环绕式/8字缠绕）",
-            "面料": "主体织物（针织网眼/3D编织/弹力布/莱卡混纺）",
-            "支撑条": "掌侧刚性支撑（铝合金板/塑钢板/硅胶条/TPU条/无）",
-            "拇指固定环": "拇指穿过的固定结构（弹力环/魔术贴环/无）",
-            "加压垫": "局部加压缓冲（硅胶垫/EVA垫/凝胶垫/气囊/无）",
-        },
-        "user_perception": {
-            "绑带": "高", "面料": "高", "支撑条": "高",
-            "拇指固定环": "中", "加压垫": "中",
-        },
-    },
-}
+@dataclass
+class ProductCategoryInfo:
+    """产品品类信息，作为模块拆解的输入参数"""
+    category_l1: str = ""      # 一级品类（如"护具"）
+    category_l2: str = ""      # 二级品类（如"护踝"）
+    category_l3: str = ""      # 三级品类（如"骨折护踝"）
+    product_name: str = ""     # 产品名称
+
+    def display_category(self) -> str:
+        """拼接品类显示文本"""
+        parts = [p for p in [self.category_l1, self.category_l2, self.category_l3] if p]
+        return " > ".join(parts) if parts else "未知"
+
+    def rag_query_text(self) -> str:
+        """构建 RAG 检索用的查询文本"""
+        parts = [p for p in [self.category_l1, self.category_l2, self.category_l3, self.product_name] if p]
+        return " - ".join(parts)
 
 
-def _match_category(category: str) -> str | None:
-    """从品类字符串中匹配到品类定义key"""
-    if not category:
-        return None
-    for key in CATEGORY_MODULES:
-        if key in category:
-            return key
+# ============================================================
+# RAG 向量库检索接口
+# ============================================================
+
+async def match_category_by_rag(category_info: ProductCategoryInfo) -> list[str] | None:
+    """
+    通过向量库检索最相似产品的模块列表（骨架）。
+
+    输入: ProductCategoryInfo（L1/L2/L3/产品名）
+    输出: 匹配到的模块名称列表，或 None（无匹配，走通用Fallback）
+
+    当前状态：向量库未建好，始终返回 None。
+    待知识库构建完成后，实现向量检索逻辑：
+      1. 用 category_info.rag_query_text() 做 embedding
+      2. 在向量库中检索最相似产品
+      3. 相似度 > 阈值 → 返回该产品的模块列表
+      4. 相似度 < 阈值 → 返回 None
+    """
+    logger.info(
+        f"[RAG匹配] 查询: {category_info.rag_query_text()} — "
+        f"向量库未接入，返回None走通用Fallback"
+    )
     return None
 
 
-def _build_module_spec(category_key: str) -> str:
-    """为Prompt生成品类模块规范文本"""
-    spec = CATEGORY_MODULES[category_key]
-    lines = [f"该产品属于【{category_key}】类，必须按以下 {len(spec['modules'])} 个模块拆解："]
-    for i, mod in enumerate(spec["modules"], 1):
-        desc = spec["descriptions"][mod]
-        perception = spec["user_perception"][mod]
-        lines.append(f"  {i}. {mod} — {desc}（用户感知度：{perception}）")
+# ============================================================
+# Prompt 生成
+# ============================================================
+
+def _build_module_spec_from_rag(modules: list[str], category_info: ProductCategoryInfo) -> str:
+    """根据 RAG 返回的模块列表，动态生成限定版 Prompt 中的模块规范"""
+    lines = [
+        f"该产品属于【{category_info.display_category()}】类，"
+        f"必须按以下 {len(modules)} 个模块拆解："
+    ]
+    for i, mod in enumerate(modules, 1):
+        lines.append(f"  {i}. {mod}")
     lines.append("")
     lines.append("严格要求：")
-    lines.append(f"1. module_name 必须使用以上 {len(spec['modules'])} 个模块名称之一，不得自创新名称")
-    lines.append("2. 如果图片中某个模块不存在（如无支撑体/无内衬），仍需列出该模块，appearance填\"无\"，material填\"无\"")
+    lines.append(f"1. module_name 必须使用以上 {len(modules)} 个模块名称之一，不得自创新名称")
+    lines.append("2. 如果图片中某个模块不存在，仍需列出该模块，appearance填\"无\"，material填\"无\"")
     lines.append("3. 如果图片不清晰无法判断某模块，confidence填\"low\"，但module_name仍必须使用规定名称")
+    lines.append("4. 如果图片中出现了以上列表之外的模块，额外添加到modules数组末尾")
     return "\n".join(lines)
 
-
-# ============================================================
-# VL模型：从图片拆解模块
-# ============================================================
 
 VL_DECOMPOSE_PROMPT = """【任务】仔细观察这张产品图片，将其拆解为独立的功能/材质模块。
 【规则】只返回一个合法的JSON对象，不要输出任何其他文字、解释或markdown格式。
@@ -189,11 +164,38 @@ VL_DECOMPOSE_PROMPT_FALLBACK = """【任务】仔细观察这张产品图片，�
 }}"""
 
 
+def _build_prompt(category_info: ProductCategoryInfo, rag_modules: list[str] | None) -> str:
+    """
+    根据是否有 RAG 匹配结果，选择限定版或通用版 Prompt。
+
+    有 RAG 结果 → 限定版（按骨架模块拆解）
+    无 RAG 结果 → 通用版（VL自由拆5-10个模块）
+    """
+    category_display = category_info.display_category()
+    product_name = category_info.product_name or "未知产品"
+
+    if rag_modules:
+        module_spec = _build_module_spec_from_rag(rag_modules, category_info)
+        return VL_DECOMPOSE_PROMPT.format(
+            module_spec=module_spec,
+            category=category_display,
+            product_name=product_name,
+        )
+    else:
+        return VL_DECOMPOSE_PROMPT_FALLBACK.format(
+            category=category_display,
+            product_name=product_name,
+        )
+
+
+# ============================================================
+# VL模型：从图片拆解模块
+# ============================================================
+
 async def vision_decompose(
     llm: LLMClient,
     image_data: bytes | str,
-    category: str = "",
-    product_name: str = "",
+    category_info: ProductCategoryInfo = None,
 ) -> dict:
     """
     用VL模型从图片中拆解产品模块。
@@ -201,29 +203,26 @@ async def vision_decompose(
     Args:
         llm: LLM客户端
         image_data: 图片数据（bytes=base64编码，str=URL/路径）
-        category: 品类信息
-        product_name: 产品名称
+        category_info: 产品品类信息（L1/L2/L3/产品名）
 
     Returns:
         {"modules": [...], "overall_description": str, "image_quality": str}
     """
+    if category_info is None:
+        category_info = ProductCategoryInfo()
+
     if not llm.is_available:
         return _fallback_decompose("LLM不可用")
 
-    # 根据品类选择Prompt（有品类定义用限定版，否则用通用版）
-    category_key = _match_category(category)
-    if category_key:
-        module_spec = _build_module_spec(category_key)
-        prompt_text = VL_DECOMPOSE_PROMPT.format(
-            module_spec=module_spec,
-            category=category or "未知",
-            product_name=product_name or "未知产品",
-        )
+    # Step 1: RAG 检索模块骨架
+    rag_modules = await match_category_by_rag(category_info)
+
+    # Step 2: 构建 Prompt
+    prompt_text = _build_prompt(category_info, rag_modules)
+    if rag_modules:
+        logger.info(f"[VL拆解] RAG匹配成功，模块骨架: {rag_modules}")
     else:
-        prompt_text = VL_DECOMPOSE_PROMPT_FALLBACK.format(
-            category=category or "未知",
-            product_name=product_name or "未知产品",
-        )
+        logger.info(f"[VL拆解] RAG未匹配，走通用Fallback")
 
     messages = [
         {"role": "system", "content": "你是产品模块拆解专家。严格只返回JSON对象，禁止输出思考过程、解释文字或markdown代码块。"},
@@ -243,6 +242,9 @@ async def vision_decompose(
             # 确保结构完整
             if "modules" not in result:
                 result = {"modules": [], "overall_description": str(result)[:200], "image_quality": "unknown"}
+            # 记录RAG骨架来源
+            if rag_modules:
+                result["_rag_modules"] = rag_modules
             return result
         else:
             raw = result.get("_raw_text", "") if isinstance(result, dict) else str(result)
@@ -260,39 +262,38 @@ async def vision_decompose(
 async def vision_decompose_multiple(
     llm: LLMClient,
     images: list[bytes | str],
-    category: str = "",
-    product_name: str = "",
+    category_info: ProductCategoryInfo = None,
 ) -> dict:
     """
     多张图片一起拆解（同一产品多角度）。
 
     Args:
         images: 多张图片数据列表
+        category_info: 产品品类信息（L1/L2/L3/产品名）
 
     Returns:
         同 vision_decompose
     """
+    if category_info is None:
+        category_info = ProductCategoryInfo()
+
     if not images:
         return _fallback_decompose("无图片数据")
 
     if len(images) == 1:
-        return await vision_decompose(llm, images[0], category, product_name)
+        return await vision_decompose(llm, images[0], category_info)
 
-    # 多图一起发送
-    category_key = _match_category(category)
-    if category_key:
-        module_spec = _build_module_spec(category_key)
-        prompt_text = VL_DECOMPOSE_PROMPT.format(
-            module_spec=module_spec,
-            category=category or "未知",
-            product_name=product_name or "未知产品",
-        )
-    else:
-        prompt_text = VL_DECOMPOSE_PROMPT_FALLBACK.format(
-            category=category or "未知",
-            product_name=product_name or "未知产品",
-        )
+    # Step 1: RAG 检索模块骨架
+    rag_modules = await match_category_by_rag(category_info)
+
+    # Step 2: 构建 Prompt
+    prompt_text = _build_prompt(category_info, rag_modules)
     prompt_text += "\n\n注意：这是同一产品的多张图片（不同角度），请综合所有图片进行模块拆解。"
+
+    if rag_modules:
+        logger.info(f"[VL多图拆解] RAG匹配成功，模块骨架: {rag_modules}")
+    else:
+        logger.info(f"[VL多图拆解] RAG未匹配，走通用Fallback")
 
     messages = [
         {"role": "system", "content": "你是产品模块拆解专家。严格只返回JSON对象，禁止输出思考过程、解释文字或markdown代码块。"},
@@ -307,6 +308,8 @@ async def vision_decompose_multiple(
         if isinstance(result, dict) and not result.get("_parse_error"):
             if "modules" not in result:
                 result = {"modules": [], "overall_description": str(result)[:200], "image_quality": "unknown"}
+            if rag_modules:
+                result["_rag_modules"] = rag_modules
             return result
         else:
             return _fallback_decompose("返回格式异常")
