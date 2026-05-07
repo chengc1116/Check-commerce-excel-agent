@@ -422,6 +422,58 @@ class ProductQuery:
             for r in rows
         ]
 
+    def get_all_cbb_modules(self, category_l2: str = "", category: str = "") -> list[dict]:
+        """
+        获取CBB模块库中的模块（可选按品类筛选）。
+
+        用于品类缺失场景的间接复用评估——当公司没有该品类产品时，
+        通过CBB模块库判断工厂是否已有可复用的面料/版型/功能组件。
+
+        Args:
+            category_l2: 二级品类（用于关联产品筛选）
+            category: CBB模块大类（如：面料、版型、功能组件等）
+
+        Returns:
+            [{"cbb_code", "cbb_name", "category", "sub_type", "supplier"}]
+        """
+        if not self.has_cbb:
+            return []
+
+        if category:
+            rows = self.conn.execute(
+                "SELECT cbb_code, cbb_name, category, sub_type, supplier "
+                "FROM cbb_modules WHERE category = ? ORDER BY category, sub_type",
+                (category,)
+            ).fetchall()
+        elif category_l2:
+            # 通过产品关联找该二级品类下用到的所有CBB模块
+            cat2_col = self._col("category2")
+            rows = self.conn.execute(
+                f"""SELECT DISTINCT m.cbb_code, m.cbb_name, m.category, m.sub_type, m.supplier
+                FROM cbb_modules m
+                INNER JOIN product_cbb_rel r ON m.cbb_code = r.cbb_code
+                INNER JOIN products p ON r.product_code = p.product_code
+                WHERE p.{cat2_col} = ?
+                ORDER BY m.category, m.sub_type""",
+                (category_l2,)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT cbb_code, cbb_name, category, sub_type, supplier "
+                "FROM cbb_modules ORDER BY category, sub_type"
+            ).fetchall()
+
+        return [
+            {
+                "cbb_code": r["cbb_code"],
+                "cbb_name": r["cbb_name"] or "",
+                "category": r["category"] or "",
+                "sub_type": r["sub_type"] or "",
+                "supplier": r["supplier"] or "",
+            }
+            for r in rows
+        ]
+
     # ============================================================
     # 品类缺失检查
     # ============================================================

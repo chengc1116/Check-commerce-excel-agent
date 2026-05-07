@@ -101,6 +101,7 @@ def _get_db():
             project_data TEXT DEFAULT '{}',
             specific_score TEXT DEFAULT '{}',
             common_scores TEXT DEFAULT '{}',
+            specific_analysis TEXT DEFAULT '{}',
             elapsed_seconds REAL DEFAULT 0,
             status TEXT DEFAULT 'processing',
             error TEXT DEFAULT '',
@@ -189,10 +190,12 @@ def _migrate_old_db():
                         new_conn.execute(
                             """INSERT INTO reviews (id,file_name,task_type,task_label,overall_score,
                                risk_level,report,project_data,specific_score,common_scores,
-                               elapsed_seconds,status,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               specific_analysis,elapsed_seconds,status,error,created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (r["id"], r["file_name"], r["task_type"], r["task_label"], r["overall_score"],
                              r["risk_level"], r["report"], r["project_data"], r["specific_score"],
-                             r["common_scores"], r["elapsed_seconds"], r["status"], r["error"], r["created_at"]),
+                             r["common_scores"], r.get("specific_analysis", "{}"),
+                             r["elapsed_seconds"], r["status"], r["error"], r["created_at"]),
                         )
                 new_conn.commit()
                 new_conn.close()
@@ -234,6 +237,17 @@ def _migrate_old_db():
 # 启动时初始化
 _init_users_db()
 _migrate_old_db()
+
+# 兼容旧数据库：添加 specific_analysis 列
+try:
+    _conn = _get_db()
+    _cols = [r[1] for r in _conn.execute("PRAGMA table_info(reviews)").fetchall()]
+    if "specific_analysis" not in _cols:
+        _conn.execute("ALTER TABLE reviews ADD COLUMN specific_analysis TEXT DEFAULT '{}'")
+        _conn.commit()
+    _conn.close()
+except Exception:
+    pass
 
 # Token 存储
 _tokens: dict[str, dict] = {}
@@ -430,15 +444,20 @@ async def _run_review(review_id: str, file_path: str, task_type: str):
             project_data_json = json.dumps(result.project_data, ensure_ascii=False)
         except (TypeError, ValueError):
             project_data_json = "{}"
+        try:
+            specific_analysis_json = json.dumps(result.specific_analysis, ensure_ascii=False)
+        except (TypeError, ValueError):
+            specific_analysis_json = "{}"
 
         conn = _get_db()
         conn.execute("""
             UPDATE reviews SET overall_score=?, risk_level=?, report=?,
                 project_data=?, specific_score=?, common_scores=?,
-                elapsed_seconds=?, status=?, error=? WHERE id=?
+                specific_analysis=?, elapsed_seconds=?, status=?, error=? WHERE id=?
         """, (
             result.overall_score, result.risk_level, result.report,
             project_data_json, specific_score_json, common_scores_json,
+            specific_analysis_json,
             result.elapsed_seconds, "completed" if not result.error else "error",
             result.error or "", review_id,
         ))
@@ -533,6 +552,7 @@ async def export_review_docx(review_id: str):
     data = dict(row)
     project_data = json.loads(data.get("project_data", "{}")) if data.get("project_data") else {}
     specific_score = json.loads(data.get("specific_score", "{}")) if data.get("specific_score") else {}
+    specific_analysis = json.loads(data.get("specific_analysis", "{}")) if data.get("specific_analysis") else {}
     common_scores = json.loads(data.get("common_scores", "{}")) if data.get("common_scores") else {}
 
     from product_review_agent.docx_generator import generate_review_docx
@@ -544,6 +564,7 @@ async def export_review_docx(review_id: str):
         risk_level=data.get("risk_level", "未知"),
         project_data=project_data,
         specific_score=specific_score,
+        specific_analysis=specific_analysis,
         common_scores=common_scores,
         report_text=data.get("report", ""),
     )

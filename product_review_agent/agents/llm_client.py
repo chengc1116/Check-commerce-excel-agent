@@ -34,7 +34,7 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "Pro/zai-org/GLM-5")
 LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-LLM_VL_MODEL = os.getenv("LLM_VL_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+LLM_VL_MODEL = os.getenv("LLM_VL_MODEL", "Pro/moonshotai/Kimi-K2.6")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3") or "0.3")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "20000") or "20000")
 
@@ -95,7 +95,7 @@ class LLMClient:
                 self._client = OpenAI(
                     api_key=self.api_key or "sk-placeholder",
                     base_url=self.base_url,
-                    timeout=httpx.Timeout(120.0, connect=15.0),
+                    timeout=httpx.Timeout(300.0, connect=15.0),
                 )
             except ImportError:
                 raise RuntimeError("openai 包未安装，请执行: pip install openai")
@@ -514,7 +514,15 @@ class LLMClient:
         """尝试修复常见的 JSON 格式问题"""
         import re as _re
 
-        fixed = json_str
+        fixed = json_str.strip()
+
+        # 修复0: 双层花括号 { { → {（LLM常见：把JSON包在外层{}里）
+        if fixed.startswith("{ {") or fixed.startswith("{{"):
+            # 尝试去掉最外层花括号
+            inner = fixed[1:].strip()
+            if inner.startswith("{"):
+                fixed = inner
+                logger.debug("JSON修复: 去掉多余外层花括号")
 
         # 修复1: 去掉行内注释 (// ... 和 /* ... */)
         fixed = _re.sub(r"//.*?$", "", fixed, flags=_re.MULTILINE)

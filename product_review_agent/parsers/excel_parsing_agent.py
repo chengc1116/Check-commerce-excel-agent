@@ -110,7 +110,8 @@ SYSTEM_PROMPT = """你是一个电商产品立项数据解析专家。你的任�
 4. 数字型字段尽量提取为数值（去掉单位符号）；日期保持原格式即可。
 5. 返回纯JSON，不要markdown代码块。"""
 
-USER_PROMPT_TEMPLATE = """以下是Excel项目书的前4个sheet的完整内容：
+# 通用模板（其他立项类型降级使用，待各类型专用模板补齐后可删除）
+FALLBACK_PROMPT = """以下是Excel项目书的前4个sheet的完整内容：
 
 {sheets_content}
 
@@ -120,9 +121,10 @@ USER_PROMPT_TEMPLATE = """以下是Excel项目书的前4个sheet的完整内容�
 
 == 字段提取说明（按大致位置提示，但请用语义理解识别，不要硬匹配列名）==
 有可能给出的表格只有一个sheet，那么就只在sheet1中去匹配以下的信息。
-【A. 基础信息】— 主要来自Sheet1（模板/品类缺失表）
+【A. 基础信息】— 主要来自Sheet1
 - project_name: 产品名称
 - brand: 品牌
+- product_code: 产品货号
 - project_time: 立项时间
 - design_time: 设计时间
 - proofing_time: 打样时间
@@ -133,24 +135,23 @@ USER_PROMPT_TEMPLATE = """以下是Excel项目书的前4个sheet的完整内容�
 - applicant: 负责人/申请人
 - market_size: 市场规模描述
 - estimated_sales: 目标销量额（提取数字，去掉单位）
-【B. 市场与定价】— 主要来自Sheet2（立项详情）中 "价格/毛利" 的相关区域也有可能来自sheet1中
+【B. 市场与定价】— 主要来自Sheet2中 "价格/毛利" 的相关区域
 - pricing: 定价（不变更形式）
 - gfm: 毛利率（如72表示72%）
 - ERP_price: ERP成本价（数字）
 - core_config: 核心配置内容，不变更形式
+- price_margin: 价格与毛利率（如"139.9单只/74%"，保留原格式）
+- erp_cost: ERP成本（数字，如36.3）
 【C. 设计要求】design_require 对象 — 来自Sheet1中"设计要求"相关区域:
-  design_require 对象内容包括：
   - content: 设计目的概述
   - outlook: 改外观/品牌的具体描述
   - material: 改材料的具体描述
   - function: 改功能的具体描述
 【D. 对比产品信息】product_comparison 对象 — 来自Sheet2中"对手分析"区域:
-  product_comparison
   - comparison_name: 对手商品名称
-  - image_url: 竞品图片
   - selling_point: 对手的卖点（我方要复制的）
   - improving_point: 我方要超越/改进的点
-【E. 使用人群】used_people 数组 — 来自Sheet3中"人群场景解析"（这部分内容会包含人群）:
+【E. 使用人群】used_people 数组 — 来自Sheet3中"人群场景解析":
   针对表格内容自定义相关字段，根据表头去补充该部分字段
 【F. 使用场景】used_scene 数组 — 来自Sheet3中"场景详细解析":
   针对表格内容自定义相关字段，根据表头去补充该部分字段
@@ -160,6 +161,22 @@ USER_PROMPT_TEMPLATE = """以下是Excel项目书的前4个sheet的完整内容�
 == 注意事项 ==
 - 找不到的字段设为null，数组字段找不到则设为空数组[]
 - 返回纯JSON，不要加```json```包裹"""
+
+# 提示词文件目录
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+
+def load_task_prompt(task_type: str) -> str:
+    """按立项类型加载对应的提示词md文件，找不到则返回通用模板"""
+    prompt_file = PROMPTS_DIR / f"{task_type}.md"
+    if prompt_file.exists():
+        content = prompt_file.read_text(encoding="utf-8").strip()
+        logger.info(f"[ExcelParsingAgent] 加载专用提示词: {prompt_file.name}")
+        return content
+    else:
+        logger.warning(f"[ExcelParsingAgent] 未找到 {task_type}.md，使用通用模板")
+        return FALLBACK_PROMPT
+
 
 
 # ============================================================
@@ -226,14 +243,19 @@ async def call_llm_with_retry(
 # 主解析流程
 # ============================================================
 
-async def parse_excel_to_project_review(file_path: str) -> dict:
-    """Excel → 结构化JSON（一次性4个sheet传入LLM）"""
+async def parse_excel_to_project_review(file_path: str, task_type: str = "") -> dict:
+    """Excel → 结构化JSON（一次性4个sheet传入LLM）
+
+    Args:
+        file_path: Excel文件路径
+        task_type: 立项类型（如hot_upgrade），用于加载对应的提示词模板
+    """
     start_time = time.time()
     file_path = str(file_path)
     filename = Path(file_path).name
 
     # Step 1: 读取Excel原始内容
-    logger.info(f"[ExcelParsingAgent] 开始解析: {filename}")
+    logger.info(f"[ExcelParsingAgent] 开始解析: {filename}, 类型: {task_type or '通用'}")
     sheets_data = read_excel_raw(file_path)
     logger.info(f"[ExcelParsingAgent] 共读取 {len(sheets_data)} 个sheet")
 
@@ -253,7 +275,11 @@ async def parse_excel_to_project_review(file_path: str) -> dict:
     logger.info(f"[ExcelParsingAgent] 传入LLM内容总长: {total_chars}字符")
     print(f"\n  📊 传入LLM: {len(useful_sheets)}个sheet, 共{total_chars}字符")
 
-    # Step 3: 调用LLM
+    # Step 3: 按task_type加载提示词模板
+    prompt_template = load_task_prompt(task_type) if task_type else FALLBACK_PROMPT
+    user_prompt = prompt_template.format(sheets_content=sheets_content)
+
+    # Step 4: 调用LLM
     from product_review_agent.agents.llm_client import get_llm_client
     llm = get_llm_client()
 
@@ -275,13 +301,19 @@ async def parse_excel_to_project_review(file_path: str) -> dict:
         result = await call_llm_with_retry(
             llm,
             system_prompt=SYSTEM_PROMPT,
-            user_prompt=USER_PROMPT_TEMPLATE.format(sheets_content=sheets_content),
+            user_prompt=user_prompt,
             use_fast_model=True,
         )
     finally:
         llm.max_tokens = original_max_tokens
 
-    # Step 4: 补充元数据
+    # Step 5: 适配层 — 将新字段映射回下游期望的格式
+    if task_type == "category_gap":
+        result = _adapt_category_gap(result)
+    elif task_type in ("hot_upgrade", "competitor_upgrade", "low_sale_iterate"):
+        result = _adapt_hot_upgrade(result)
+
+    # Step 6: 补充元数据
     elapsed = round(time.time() - start_time, 1)
     has_error = result.get("_error")
 
@@ -298,6 +330,135 @@ async def parse_excel_to_project_review(file_path: str) -> dict:
         extracted["_error"] = has_error
 
     return extracted
+
+
+def _adapt_hot_upgrade(data: dict) -> dict:
+    """爆品升级适配层：将新Prompt字段映射为下游analyzer/pipeline/reviewer期望的格式"""
+    adapted = dict(data)
+
+    # 群体分析 → used_people / used_scene / target_audience / target_scenario
+    people_analysis = data.get("people_analysis", "")
+    scene_analysis = data.get("scene_analysis", "")
+    group_extra = data.get("group_extra", "")
+
+    if people_analysis:
+        adapted["used_people"] = [{"raw_text": people_analysis}]
+        adapted["target_audience"] = people_analysis
+    if scene_analysis:
+        adapted["used_scene"] = [{"raw_text": scene_analysis}]
+        adapted["target_scenario"] = scene_analysis
+    if group_extra:
+        adapted["group_extra_text"] = group_extra
+
+    # 设计要求扁平字段 → design_require 对象
+    design_require = {}
+    if data.get("design_purpose"):
+        design_require["content"] = data["design_purpose"]
+    if data.get("outlook"):
+        design_require["outlook"] = data["outlook"]
+    if data.get("material"):
+        design_require["material"] = data["material"]
+    if data.get("function"):
+        design_require["function"] = data["function"]
+    if design_require:
+        adapted["design_require"] = design_require
+
+    # upgrade_function ← function（analyzer用upgrade_function）
+    if data.get("function") and not data.get("upgrade_function"):
+        adapted["upgrade_function"] = data["function"]
+
+    # pricing里提取gfm（毛利率）
+    pricing = data.get("pricing", "")
+    if pricing and not data.get("gfm"):
+        import re
+        m = re.search(r"[/／]\s*(\d+)\s*%?", pricing)
+        if m:
+            adapted["gfm"] = int(m.group(1))
+
+    # erp_cost → ERP_price
+    if data.get("erp_cost") and not data.get("ERP_price"):
+        adapted["ERP_price"] = data["erp_cost"]
+
+    return adapted
+
+
+def _adapt_category_gap(data: dict) -> dict:
+    """品类缺失适配层：将品类缺失专用字段映射为下游analyzer期望的格式"""
+    adapted = dict(data)
+
+    # ── 基础信息 other ──
+    if data.get("base_other"):
+        adapted["base_extra_text"] = data["base_other"]
+
+    # ── 群体分析 → used_people / used_scene / target_audience / target_scenario ──
+    people_analysis = data.get("people_analysis", "")
+    scene_analysis = data.get("scene_analysis", "")
+    group_other = data.get("group_other", "")
+
+    if people_analysis:
+        adapted["used_people"] = [{"raw_text": people_analysis}]
+        adapted["target_audience"] = people_analysis
+    if scene_analysis:
+        adapted["used_scene"] = [{"raw_text": scene_analysis}]
+        adapted["target_scenario"] = scene_analysis
+    if group_other:
+        adapted["group_extra_text"] = group_other
+
+    # ── 竞品产品分析 → product_comparison 对象 ──
+    comparison = {}
+    if data.get("competitor_url"):
+        comparison["comparison_url"] = data["competitor_url"]
+    if data.get("competitor_price"):
+        comparison["competitor_price"] = data["competitor_price"]
+    if data.get("selling_point"):
+        comparison["selling_point"] = data["selling_point"]
+    if data.get("improving_point"):
+        comparison["improving_point"] = data["improving_point"]
+    if data.get("competitor_other"):
+        comparison["competitor_other"] = data["competitor_other"]
+    if comparison:
+        adapted["product_comparison"] = comparison
+
+    # 竞品名称/链接 → competitor_name（analyzer用）
+    if data.get("competitor_url") and not data.get("competitor_name"):
+        adapted["competitor_name"] = data.get("competitor_url")
+
+    # ── 设计要求扁平字段 → design_require 对象 ──
+    design_require = {}
+    if data.get("design_purpose"):
+        design_require["content"] = data["design_purpose"]
+    if data.get("outlook"):
+        design_require["outlook"] = data["outlook"]
+    if data.get("material"):
+        design_require["material"] = data["material"]
+    if data.get("function"):
+        design_require["function"] = data["function"]
+    if data.get("design_other"):
+        design_require["design_other"] = data["design_other"]
+    if design_require:
+        adapted["design_require"] = design_require
+
+    # design_purpose → upgrade_direction（品类缺失没有升级方向，用设计目的替代）
+    if data.get("design_purpose") and not data.get("upgrade_direction"):
+        adapted["upgrade_direction"] = data["design_purpose"]
+
+    # function → upgrade_function
+    if data.get("function") and not data.get("upgrade_function"):
+        adapted["upgrade_function"] = data["function"]
+
+    # ── pricing里提取gfm（毛利率） ──
+    pricing = data.get("pricing", "")
+    if pricing and not data.get("gfm"):
+        import re
+        m = re.search(r"[/／]\s*(\d+)\s*%?", pricing)
+        if m:
+            adapted["gfm"] = int(m.group(1))
+
+    # erp_cost → ERP_price
+    if data.get("erp_cost") and not data.get("ERP_price"):
+        adapted["ERP_price"] = data["erp_cost"]
+
+    return adapted
 
 
 # ============================================================

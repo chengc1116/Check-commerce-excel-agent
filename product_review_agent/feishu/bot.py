@@ -457,6 +457,7 @@ def _run_review_in_thread(
                 risk_level=result.risk_level,
                 project_data=result.project_data or {},
                 specific_score=specific_dict,
+                specific_analysis=result.specific_analysis or {},
                 common_scores=common_dict,
                 report_text=result.report or "",
             )

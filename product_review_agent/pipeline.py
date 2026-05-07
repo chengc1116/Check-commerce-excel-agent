@@ -62,7 +62,7 @@ class PipelineResult:
     error: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "file_name": self.file_name,
             "task_type": self.task_type,
             "task_label": self.task_label,
@@ -70,9 +70,16 @@ class PipelineResult:
             "risk_level": self.risk_level,
             "elapsed_seconds": round(self.elapsed_seconds, 1),
             "common_scores": self.common_scores,
+            "specific_analysis": self.specific_analysis,
             "specific_score": self.specif_score_to_dict(),
             "error": self.error,
         }
+        # 如果specific_analysis包含项目数据，补充product_code和brand到顶层
+        if self.specific_analysis:
+            for key in ("product_code", "brand", "category_info", "project_data", "vl_report", "market_overview"):
+                if key in self.specific_analysis and key not in result:
+                    result[key] = self.specific_analysis[key]
+        return result
 
     def specif_score_to_dict(self) -> dict:
         if self.specific_score and hasattr(self.specific_score, "to_dict"):
@@ -104,11 +111,11 @@ def _save_parsed_json(file_stem: str, project_data: dict):
         logger.warning(f"[Pipeline] 保存解析JSON失败(不影响主流程): {e}")
 
 
-async def _parse_excel(file_path: str) -> dict:
+async def _parse_excel(file_path: str, task_type: str = "") -> dict:
     """Excel → 结构化JSON"""
     try:
         from product_review_agent.parsers.excel_parsing_agent import parse_excel_to_project_review
-        result = await parse_excel_to_project_review(file_path)
+        result = await parse_excel_to_project_review(file_path, task_type=task_type)
 
         if result.get("_error"):
             logger.error(f"[Pipeline] Excel解析出错: {result['_error']}")
@@ -183,68 +190,64 @@ def _extract_basic_info(project_data: dict) -> dict:
     }
 
 
-async def _score_audience(project_data: dict) -> dict:
-    """人群分析评分"""
-    from product_review_agent.reviewer import ascore_with_llm, _fallback_score
+async def _score_audience_scenario(project_data: dict) -> dict:
+    """人群+场景合并分析评分"""
+    from product_review_agent.reviewer import ascore_with_llm, _fallback_score, _build_audience_scenario_prompt
     from product_review_agent.agents.llm_client import get_llm_client
 
     llm = get_llm_client()
 
-    # 从 used_people 提取人群文本
+    # 提取人群文本
     used_people = project_data.get("used_people", [])
-    if not used_people:
-        return _fallback_score("audience", reason="no_data")
-    else:
-        # 将 used_people 数组转为文本
+    if used_people:
         audience_text = json.dumps(used_people, ensure_ascii=False, indent=2)
-
-    if "[图片" in audience_text and len(audience_text.strip()) < 50:
-        return _fallback_score("audience", reason="no_data")
-
-    return await ascore_with_llm(llm, audience_text, "audience")
-
-
-async def _score_scenario(project_data: dict) -> dict:
-    """场景分析评分"""
-    from product_review_agent.reviewer import ascore_with_llm, _fallback_score
-    from product_review_agent.agents.llm_client import get_llm_client
-
-    llm = get_llm_client()
-
-    # 从 used_scene 提取场景文本
-    used_scene = project_data.get("used_scene", [])
-    if not used_scene:
-        scenario_text = project_data.get("usage_scenarios", "")
-        if not scenario_text:
-            return _fallback_score("scenario", reason="no_data")
     else:
+        audience_text = ""
+
+    # 提取场景文本
+    used_scene = project_data.get("used_scene", [])
+    if used_scene:
         scenario_text = json.dumps(used_scene, ensure_ascii=False, indent=2)
+    else:
+        scenario_text = project_data.get("usage_scenarios", "")
 
-    if "[图片" in scenario_text and len(scenario_text.strip()) < 50:
-        return _fallback_score("scenario", reason="no_data")
+    # 两者都为空则回退
+    has_audience = bool(audience_text) and not ("[图片" in audience_text and len(audience_text.strip()) < 50)
+    has_scenario = bool(scenario_text) and not ("[图片" in scenario_text and len(scenario_text.strip()) < 50)
 
-    return await ascore_with_llm(llm, scenario_text, "scenario")
+    if not has_audience and not has_scenario:
+        return _fallback_score("audience_scenario", reason="no_data")
+
+    # 构建产品上下文
+    product_context = {
+        "product_name": project_data.get("project_name") or project_data.get("product_name", "未知"),
+        "brand": project_data.get("brand", "未知"),
+        "category_l1": project_data.get("category_l1") or project_data.get("categoryl1", ""),
+        "category_l2": project_data.get("category_l2") or project_data.get("categoryl2", ""),
+        "category_l3": project_data.get("category_l3") or project_data.get("categoryl3", ""),
+        "pricing": project_data.get("pricing", "未填写"),
+        "estimated_sales": project_data.get("estimated_sales", "未填写"),
+    }
+
+    # 构建完整prompt
+    prompt = _build_audience_scenario_prompt(audience_text, scenario_text, product_context)
+
+    return await ascore_with_llm(llm, prompt, "audience_scenario")
 
 
 async def _analyze_common(project_data: dict) -> dict:
     """
-    公共分析：基本信息 + 人群评分 + 场景评分
-
-    人群和场景并行评分
+    公共分析：基本信息 + 人群场景合并评分
     """
     # 基本信息（同步提取）
     basic_info = _extract_basic_info(project_data)
 
-    # 并行评分
-    audience_score, scenario_score = await asyncio.gather(
-        _score_audience(project_data),
-        _score_scenario(project_data),
-    )
+    # 人群+场景合并评分
+    audience_scenario_score = await _score_audience_scenario(project_data)
 
     return {
         "basic_info": basic_info,
-        "audience_score": audience_score,
-        "scenario_score": scenario_score,
+        "audience_scenario_score": audience_scenario_score,
     }
 
 
@@ -406,39 +409,93 @@ def _generate_report(
     lines.append(f"  ERP成本: {basic.get('ERP_price', '(未填写)')}")
     lines.append("")
 
-    # 竞品对比信息
+    # 竞品对比信息（LLM可能返回dict或list）
     comparison = basic.get("product_comparison", {})
     if comparison:
-        lines.append(f"  对手商品: {comparison.get('comparison_name', '(未填写)')}")
-        lines.append(f"  对手卖点(复制): {comparison.get('selling_point', '(未填写)')}")
-        lines.append(f"  对手卖点(超越): {comparison.get('improving_point', '(未填写)')}")
+        # 兼容 list 和 dict 两种格式
+        if isinstance(comparison, list):
+            for i, comp in enumerate(comparison):
+                prefix = f"  竞品{i + 1} " if len(comparison) > 1 else "  "
+                if isinstance(comp, dict):
+                    lines.append(f"{prefix}对手商品: {comp.get('comparison_name', '(未填写)')}")
+                    lines.append(f"{prefix}对手卖点(复制): {comp.get('selling_point', '(未填写)')}")
+                    lines.append(f"{prefix}对手卖点(超越): {comp.get('improving_point', '(未填写)')}")
+                else:
+                    lines.append(f"{prefix}{comp}")
+            lines.append("")
+        else:
+            lines.append(f"  对手商品: {comparison.get('comparison_name', '(未填写)')}")
+            lines.append(f"  对手卖点(复制): {comparison.get('selling_point', '(未填写)')}")
+            lines.append(f"  对手卖点(超越): {comparison.get('improving_point', '(未填写)')}")
+            lines.append("")
+
+    # 三、人群与场景分析（合并）
+    as_score = common_analysis.get("audience_scenario_score", {})
+    as_total = as_score.get("total_score", 0)
+
+    lines.append(THIN_SEP)
+    lines.append(f"三、人群与场景分析 [评分: {as_total}/100] [{_stars_display(_score_stars(as_total))}]")
+    lines.append(THIN_SEP)
+
+    # 分析段落
+    analysis = as_score.get("analysis", {})
+    if analysis:
+        dim_labels = {
+            "audience_scene_fit": "人群-场景匹配度",
+            "insight_depth": "需求洞察深度",
+            "data_coverage": "数据支撑与覆盖度",
+            "commercial_value": "商业价值判断",
+        }
+        for key, label in dim_labels.items():
+            text = analysis.get(key, "")
+            if text:
+                lines.append(f"  [{label}]")
+                for para_line in text.split("\n"):
+                    lines.append(f"    {para_line}")
+                lines.append("")
+
+    # 专家分析
+    expert = as_score.get("expert_analysis", {})
+    if expert:
+        lines.append("  ── 专家视角：人群与场景建议 ──")
+        if expert.get("target_audience"):
+            lines.append(f"  建议目标人群: {expert['target_audience']}")
+        if expert.get("core_scenarios"):
+            lines.append(f"  建议核心场景: {expert['core_scenarios']}")
+        if expert.get("key_suggestion"):
+            lines.append(f"  关键建议: {expert['key_suggestion']}")
         lines.append("")
 
-    # 三、人群分析
-    audience_score = common_analysis.get("audience_score", {})
-    audience_total = audience_score.get("total_score", 0)
+    # 评分明细
+    scores = as_score.get("scores", {})
+    if scores:
+        lines.append("  [评分明细]")
+        for dim_name, dim_info in scores.items():
+            if isinstance(dim_info, dict):
+                s = dim_info.get("score", 0)
+                r = dim_info.get("reason", "")
+                lines.append(f"    {dim_name}: {s}/25 - {r}")
+        lines.append("")
 
-    lines.append(THIN_SEP)
-    lines.append(f"三、人群分析 [评分: {audience_total}/100] [{_stars_display(_score_stars(audience_total))}]")
-    lines.append(THIN_SEP)
-    _append_score_detail(lines, audience_score, audience_total, "人群")
+    # 优劣势和建议
+    for label, key in [("优势", "strengths"), ("不足", "weaknesses"), ("改进建议", "suggestions")]:
+        items = as_score.get(key, [])
+        if items:
+            prefix = "+" if label == "优势" else ("-" if label == "不足" else ">")
+            lines.append(f"  [{label}]")
+            for item in items:
+                lines.append(f"    {prefix} {item}")
+            lines.append("")
+    if not analysis and not expert:
+        _append_score_detail(lines, as_score, as_total, "人群与场景")
 
-    # 四、场景分析
-    scenario_score = common_analysis.get("scenario_score", {})
-    scenario_total = scenario_score.get("total_score", 0)
-
-    lines.append(THIN_SEP)
-    lines.append(f"四、场景分析 [评分: {scenario_total}/100] [{_stars_display(_score_stars(scenario_total))}]")
-    lines.append(THIN_SEP)
-    _append_score_detail(lines, scenario_score, scenario_total, "场景")
-
-    # 五、专项分析（核心部分）
+    # 四、专项分析（核心部分）
     if specific_analysis and not specific_analysis.get("_error"):
         analyzer = _get_analyzer(task_type)
         if analyzer:
             specific_report = analyzer.format_report(specific_analysis, specific_score)
             lines.append(THIN_SEP)
-            lines.append(f"五、{task_label}专项分析")
+            lines.append(f"四、{task_label}专项分析")
             lines.append(THIN_SEP)
             # 缩进专项报告
             for line in specific_report.split("\n"):
@@ -446,25 +503,25 @@ def _generate_report(
             lines.append("")
         else:
             lines.append(THIN_SEP)
-            lines.append(f"五、{task_label}专项分析 (分析器不可用)")
+            lines.append(f"四、{task_label}专项分析 (分析器不可用)")
             lines.append(THIN_SEP)
             lines.append("")
     else:
         lines.append(THIN_SEP)
-        lines.append("五、专项分析 (不可用)")
+        lines.append("四、专项分析 (不可用)")
         lines.append(THIN_SEP)
         err = specific_analysis.get("_error", "未知原因") if specific_analysis else "无分析结果"
         lines.append(f"  专项分析不可用: {err}")
         lines.append("")
 
-    # 六、同类产品及销售情况
+    # 五、同类产品及销售情况
     if product_analysis and product_analysis.get("products"):
         products = product_analysis["products"]
         analysis = product_analysis.get("analysis")
         category_l2 = basic.get("category_l2", "未知")
 
         lines.append(THIN_SEP)
-        lines.append("六、同类产品及销售情况")
+        lines.append("五、同类产品及销售情况")
         lines.append(THIN_SEP)
         lines.append(f"  品类「{category_l2}」现有活跃产品（共 {len(products)} 个）:")
         lines.append("")
@@ -537,23 +594,22 @@ def _generate_report(
                     lines.append(f"  > {sg}")
                 lines.append("")
 
-    # 七、综合评估
+    # 六、综合评估
     lines.append(THIN_SEP)
-    lines.append("七、综合评估")
+    lines.append("六、综合评估")
     lines.append(THIN_SEP)
 
-    # 计算综合分
-    weights = {
-        "人群": 0.2,
-        "场景": 0.2,
-        "专项": 0.6,  # 专项分析权重最大
-    }
+    # 计算综合分（按任务类型区分权重）
+    # 爆品升级：人群场景0.2 + 专项0.8
+    # 其他类型：人群场景0.4 + 专项0.6
+    if task_type == "hot_upgrade":
+        weights = {"人群与场景": 0.2, "专项": 0.8}
+    else:
+        weights = {"人群与场景": 0.4, "专项": 0.6}
 
     valid_scores = []
-    if audience_total > 0:
-        valid_scores.append(("人群", audience_total, weights["人群"]))
-    if scenario_total > 0:
-        valid_scores.append(("场景", scenario_total, weights["场景"]))
+    if as_total > 0:
+        valid_scores.append(("人群与场景", as_total, weights["人群与场景"]))
 
     # 专项分析得分
     specific_total = 0
@@ -571,8 +627,8 @@ def _generate_report(
         if total_weight > 0:
             overall = int(round(sum(s * w / total_weight for _, s, w in valid_scores)))
 
-        for name, score, _ in valid_scores:
-            lines.append(f"  {name}评分: {score}/100")
+        for name, score, weight in valid_scores:
+            lines.append(f"  {name}评分: {score}/100 (权重{weight:.0%})")
         lines.append(f"  综合评分: {overall}/100")
         lines.append(f"  星级: [{_stars_display(_score_stars(overall))}]")
 
@@ -663,7 +719,7 @@ async def run_pipeline(file_path: str, task_type: str) -> PipelineResult:
     # 图片提取是同步IO密集型，放到线程池
     loop = asyncio.get_event_loop()
     project_data, images = await asyncio.gather(
-        _parse_excel(str(file_path)),
+        _parse_excel(str(file_path), task_type=task_type),
         loop.run_in_executor(None, _extract_images, str(file_path)),
     )
 
@@ -708,16 +764,15 @@ async def run_pipeline(file_path: str, task_type: str) -> PipelineResult:
 
     # 记录：分析阶段结果
     step2_ms = int((time.time() - step2_start) * 1000)
-    audience_total = common_analysis.get("audience_score", {}).get("total_score", 0)
-    scenario_total = common_analysis.get("scenario_score", {}).get("total_score", 0)
+    as_total = common_analysis.get("audience_scenario_score", {}).get("total_score", 0)
     specific_total = 0
     if specific_score and hasattr(specific_score, "total_score"):
         specific_total = specific_score.total_score
 
     op_log.log("analysis_complete", "review", target=file_path.name,
-               detail=f"人群{audience_total}/场景{scenario_total}/专项{specific_total}",
+               detail=f"人群场景{as_total}/专项{specific_total}",
                elapsed_ms=step2_ms,
-               extra={"audience_score": audience_total, "scenario_score": scenario_total,
+               extra={"audience_scenario_score": as_total,
                       "specific_score": specific_total, "task_type": task_type})
 
     # ==================== Step 3: 报告整合 ====================
@@ -733,13 +788,14 @@ async def run_pipeline(file_path: str, task_type: str) -> PipelineResult:
         task_label=f"{task_emoji} {task_label}",
     )
 
-    # 计算综合分
-    weights = {"人群": 0.2, "场景": 0.2, "专项": 0.6}
+    # 计算综合分（按任务类型区分权重）
+    if task_type == "hot_upgrade":
+        weights = {"人群与场景": 0.2, "专项": 0.8}
+    else:
+        weights = {"人群与场景": 0.4, "专项": 0.6}
     valid_scores = []
-    if audience_total > 0:
-        valid_scores.append(("人群", audience_total, weights["人群"]))
-    if scenario_total > 0:
-        valid_scores.append(("场景", scenario_total, weights["场景"]))
+    if as_total > 0:
+        valid_scores.append(("人群与场景", as_total, weights["人群与场景"]))
     if specific_total > 0:
         valid_scores.append(("专项", specific_total, weights["专项"]))
 
@@ -758,8 +814,7 @@ async def run_pipeline(file_path: str, task_type: str) -> PipelineResult:
 
     # 构建公共评分dict（供飞书卡片使用）
     common_scores = {
-        "audience": common_analysis.get("audience_score", {}),
-        "scenario": common_analysis.get("scenario_score", {}),
+        "audience_scenario": common_analysis.get("audience_scenario_score", {}),
     }
 
     elapsed = time.time() - start_time

@@ -4,20 +4,46 @@
 
 共享模块，供 Web API 和飞书 Bot 共同使用。
 生成格式化的 .docx 审核报告文档。
+
+报告结构：
+  一、立项信息
+  二、市场与定价
+  三、人群与场景分析
+  四、专项分析（含逐模块差距矩阵表格）
+  五、综合评估
+  附：设计要求
 """
 
 from __future__ import annotations
 
+import json
 import tempfile
 import os
 from datetime import datetime
 from typing import Optional
 
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
+from docx.shared import Pt, Cm, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
+
+
+# ============================================================
+# 颜色常量
+# ============================================================
+COLOR_DARK = RGBColor(0x1A, 0x1A, 0x2E)
+COLOR_GREEN = RGBColor(0x00, 0x80, 0x00)
+COLOR_RED = RGBColor(0xCC, 0x33, 0x00)
+COLOR_BLUE = RGBColor(0x00, 0x78, 0xD4)
+COLOR_GRAY = RGBColor(0x66, 0x66, 0x66)
+
+GAP_COLORS = {
+    "高": RGBColor(0xCC, 0x33, 0x00),
+    "中": RGBColor(0xFF, 0x99, 0x00),
+    "低": RGBColor(0x00, 0x80, 0x00),
+    "无": RGBColor(0x99, 0x99, 0x99),
+}
 
 
 # ============================================================
@@ -31,6 +57,7 @@ def generate_review_docx(
     risk_level: str = "未知",
     project_data: Optional[dict] = None,
     specific_score: Optional[dict] = None,
+    specific_analysis: Optional[dict] = None,
     common_scores: Optional[dict] = None,
     report_text: str = "",
     save_dir: Optional[str] = None,
@@ -39,21 +66,23 @@ def generate_review_docx(
     生成审核报告 Word 文档。
 
     Args:
-        file_name: 原始文件名（用于命名输出文件）
+        file_name: 原始文件名
         task_label: 审核类型标签
         overall_score: 综合评分
         risk_level: 风险等级
         project_data: Excel 解析出的项目数据
-        specific_score: 专项分析评分
-        common_scores: 公共分析评分（人群+场景）
-        report_text: 完整审核报告文本
-        save_dir: 保存目录，默认为临时目录
+        specific_score: 专项分析评分（dict 或 AnalyzerScore）
+        specific_analysis: 专项分析原始结果（含 module_comparison 等）
+        common_scores: 公共分析评分（含 audience_scenario）
+        report_text: 完整审核报告文本（备用，提取设计要求等）
+        save_dir: 保存目录
 
     Returns:
         生成的 .docx 文件绝对路径
     """
     project_data = project_data or {}
     specific_score = specific_score or {}
+    specific_analysis = specific_analysis or {}
     common_scores = common_scores or {}
 
     doc = Document()
@@ -70,40 +99,44 @@ def generate_review_docx(
     title = doc.add_heading("产品立项审核报告", level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     for run in title.runs:
-        run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x2E)
+        run.font.color.rgb = COLOR_DARK
 
-    # ---- 产品概览表 ----
-    doc.add_heading("产品概览", level=1)
+    # ---- 评分总览条 ----
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(f"综合评分: {overall_score}/100  |  风险等级: {risk_level}  |  {task_label}")
+    run.bold = True
+    run.font.size = Pt(12)
+    run.font.color.rgb = _score_color(overall_score)
 
-    overview_items = [
-        ("产品名称", project_data.get("project_name", "(未填写)")),
+    # ================================================================
+    # 一、立项信息
+    # ================================================================
+    doc.add_heading("一、立项信息", level=1)
+
+    info_items = [
+        ("产品名称", project_data.get("project_name") or project_data.get("product_name", "(未填写)")),
         ("品牌", project_data.get("brand", "(未填写)")),
         ("品类", " > ".join(filter(None, [
-            project_data.get("categoryl1", ""),
-            project_data.get("categoryl2", ""),
-            project_data.get("categoryl3", ""),
+            project_data.get("categoryl1", "") or project_data.get("category_l1", ""),
+            project_data.get("categoryl2", "") or project_data.get("category_l2", ""),
+            project_data.get("categoryl3", "") or project_data.get("category_l3", ""),
         ])) or "(未填写)"),
         ("负责人", project_data.get("applicant", "(未填写)")),
-        ("审核类型", task_label),
-        ("综合评分", f"{overall_score}/100"),
-        ("风险等级", risk_level),
-        ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")),
-    ]
-
-    _add_kv_table(doc, overview_items)
-
-    # ---- 立项信息 ----
-    doc.add_heading("立项信息", level=1)
-    time_items = [
         ("立项时间", project_data.get("project_time", "(未填写)")),
         ("设计时间", project_data.get("design_time", "(未填写)")),
         ("打样时间", project_data.get("proofing_time", "(未填写)")),
         ("上架时间", project_data.get("launch_time", "(未填写)")),
+        ("审核类型", task_label),
+        ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")),
     ]
-    _add_kv_table(doc, time_items)
+    _add_kv_table(doc, info_items)
 
-    # ---- 市场与定价 ----
-    doc.add_heading("市场与定价", level=1)
+    # ================================================================
+    # 二、市场与定价
+    # ================================================================
+    doc.add_heading("二、市场与定价", level=1)
+
     market_items = [
         ("市场规模", project_data.get("market_size", "(未填写)")),
         ("目标销量", project_data.get("estimated_sales", "(未填写)")),
@@ -113,58 +146,168 @@ def generate_review_docx(
     ]
     _add_kv_table(doc, market_items)
 
-    # ---- 人群分析 ----
-    doc.add_heading("人群分析", level=1)
-    audience = common_scores.get("audience", {})
-    if audience and audience.get("total_score"):
-        _add_score_section(doc, audience, "人群")
-    else:
-        doc.add_paragraph("(暂无人群评分数据)")
+    # 竞品对比信息
+    comparison = project_data.get("product_comparison")
+    if comparison:
+        doc.add_paragraph("")  # 空行
+        p = doc.add_paragraph()
+        run = p.add_run("竞品对标")
+        run.bold = True
+        run.font.size = Pt(11)
 
-    # ---- 场景分析 ----
-    doc.add_heading("场景分析", level=1)
-    scenario = common_scores.get("scenario", {})
-    if scenario and scenario.get("total_score"):
-        _add_score_section(doc, scenario, "场景")
-    else:
-        doc.add_paragraph("(暂无场景评分数据)")
+        if isinstance(comparison, list):
+            for i, comp in enumerate(comparison):
+                prefix = f"竞品{i + 1}" if len(comparison) > 1 else "竞品"
+                if isinstance(comp, dict):
+                    comp_items = [
+                        (f"{prefix} - 对手商品", comp.get("comparison_name", "(未填写)")),
+                        (f"{prefix} - 对手卖点(复制)", comp.get("selling_point", "(未填写)")),
+                        (f"{prefix} - 对手卖点(超越)", comp.get("improving_point", "(未填写)")),
+                    ]
+                    _add_kv_table(doc, comp_items)
+                else:
+                    doc.add_paragraph(f"  {prefix}: {comp}")
+        elif isinstance(comparison, dict):
+            comp_items = [
+                ("对手商品", comparison.get("comparison_name", "(未填写)")),
+                ("对手卖点(复制)", comparison.get("selling_point", "(未填写)")),
+                ("对手卖点(超越)", comparison.get("improving_point", "(未填写)")),
+            ]
+            _add_kv_table(doc, comp_items)
 
-    # ---- 专项分析 ----
-    doc.add_heading(f"{task_label or '专项'}分析", level=1)
+    # ================================================================
+    # 三、人群与场景分析
+    # ================================================================
+    doc.add_heading("三、人群与场景分析", level=1)
+
+    as_score = common_scores.get("audience_scenario", {})
+    if as_score and as_score.get("total_score"):
+        _add_audience_scenario_section(doc, as_score)
+    else:
+        # 兼容旧格式（单独的 audience + scenario）
+        audience = common_scores.get("audience", {})
+        scenario = common_scores.get("scenario", {})
+        if audience and audience.get("total_score"):
+            _add_score_section(doc, audience, "人群")
+        if scenario and scenario.get("total_score"):
+            _add_score_section(doc, scenario, "场景")
+        if not audience and not scenario:
+            doc.add_paragraph("(暂无人群与场景评分数据)")
+
+    # ================================================================
+    # 四、专项分析
+    # ================================================================
+    doc.add_heading(f"四、{task_label or '专项'}分析", level=1)
+
     if specific_score:
         _add_score_section(doc, specific_score, "专项")
-    else:
-        doc.add_paragraph("(暂无专项评分数据)")
 
-    # ---- 完整报告文本 ----
-    if report_text:
-        doc.add_heading("完整审核报告", level=1)
-        for line in report_text.split("\n"):
-            line = line.strip()
-            if not line:
-                doc.add_paragraph("")
-                continue
-            if line.startswith("====") or line.startswith("----"):
-                continue
-            if line.startswith(("一、", "二、", "三、", "四、", "五、", "六、", "七、", "附、")):
-                h = doc.add_heading(line, level=2)
-                for run in h.runs:
-                    run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x2E)
-            elif line.startswith("  "):
-                p = doc.add_paragraph(line.strip())
-                p.paragraph_format.left_indent = Cm(0.5)
-            elif line.startswith("> "):
-                p = doc.add_paragraph(line[2:])
-                p.paragraph_format.left_indent = Cm(0.5)
-                for run in p.runs:
-                    run.font.color.rgb = RGBColor(0x00, 0x78, 0xD4)
-            elif line.startswith("[") and "]" in line:
-                p = doc.add_paragraph()
-                run = p.add_run(line)
-                run.bold = True
-                run.font.size = Pt(10.5)
-            else:
-                doc.add_paragraph(line)
+    # VL对比拆解详细内容
+    vl_report = specific_analysis.get("vl_report", {}) if specific_analysis else {}
+    if vl_report and "error" not in vl_report:
+        _add_vl_report_sections(doc, vl_report)
+
+    # 逐模块差距矩阵（Word 表格）
+    module_comparison = _extract_module_comparison(specific_analysis)
+    if module_comparison:
+        doc.add_paragraph("")
+        p = doc.add_paragraph()
+        run = p.add_run("逐模块差距矩阵")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        _add_module_comparison_table(doc, module_comparison)
+
+    # 升级路线图
+    upgrade_roadmap = _extract_roadmap(specific_analysis)
+    if upgrade_roadmap:
+        doc.add_paragraph("")
+        p = doc.add_paragraph()
+        run = p.add_run("升级路线图")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        _add_roadmap_table(doc, upgrade_roadmap)
+
+    # 分析摘要
+    summary = _extract_summary(specific_analysis)
+    if summary:
+        _add_summary_section(doc, summary)
+
+    if not specific_score and not module_comparison and not vl_report:
+        doc.add_paragraph("(暂无专项分析数据)")
+
+    # ================================================================
+    # 五、综合评估
+    # ================================================================
+    doc.add_heading("五、综合评估", level=1)
+
+    # 综合评分
+    p = doc.add_paragraph()
+    run = p.add_run(f"综合评分: {overall_score}/100")
+    run.bold = True
+    run.font.size = Pt(14)
+    run.font.color.rgb = _score_color(overall_score)
+
+    p = doc.add_paragraph()
+    run = p.add_run(f"风险等级: {risk_level}")
+    run.bold = True
+    if risk_level == "高":
+        run.font.color.rgb = COLOR_RED
+    elif risk_level == "中":
+        run.font.color.rgb = RGBColor(0xFF, 0x99, 0x00)
+    else:
+        run.font.color.rgb = COLOR_GREEN
+
+    # 权重明细
+    p = doc.add_paragraph()
+    as_total = as_score.get("total_score", 0) if as_score else 0
+    sp_total = _get_specific_total(specific_score)
+    p.add_run("评分权重: ").bold = True
+    p.add_run(f"人群与场景 × 0.4 ({as_total}分) + 专项分析 × 0.6 ({sp_total}分)")
+
+    # 各部分优劣势汇总
+    all_strengths = []
+    all_weaknesses = []
+    all_suggestions = []
+
+    if as_score:
+        all_strengths.extend(as_score.get("strengths", []))
+        all_weaknesses.extend(as_score.get("weaknesses", []))
+        all_suggestions.extend(as_score.get("suggestions", []))
+
+    if specific_score:
+        all_strengths.extend(specific_score.get("strengths", []))
+        all_weaknesses.extend(specific_score.get("weaknesses", []))
+        all_suggestions.extend(specific_score.get("suggestions", []))
+
+    if all_strengths:
+        _add_bullet_list(doc, "优势", all_strengths, COLOR_GREEN, "✅")
+    if all_weaknesses:
+        _add_bullet_list(doc, "不足", all_weaknesses, COLOR_RED, "⚠️")
+    if all_suggestions:
+        _add_bullet_list(doc, "改进建议", all_suggestions, COLOR_BLUE, "💡")
+
+    # ================================================================
+    # 附：设计要求
+    # ================================================================
+    design_req = project_data.get("design_requirements", "")
+    if not design_req:
+        design_req = project_data.get("design_requirement", "")
+    if not design_req:
+        # 从 report_text 中提取
+        design_req = _extract_design_requirements(report_text)
+
+    if design_req:
+        doc.add_heading("附：设计要求", level=1)
+        if isinstance(design_req, list):
+            for item in design_req:
+                doc.add_paragraph(str(item), style="List Bullet")
+        else:
+            for line in str(design_req).split("\n"):
+                line = line.strip()
+                if line:
+                    doc.add_paragraph(line)
 
     # ---- 保存文件 ----
     if save_dir is None:
@@ -179,6 +322,16 @@ def generate_review_docx(
 # ============================================================
 # 内部辅助函数
 # ============================================================
+
+def _score_color(score: int) -> RGBColor:
+    """根据分值返回颜色"""
+    if score >= 75:
+        return COLOR_GREEN
+    elif score >= 50:
+        return RGBColor(0xFF, 0x99, 0x00)
+    else:
+        return COLOR_RED
+
 
 def _add_kv_table(doc, items: list[tuple[str, str]]):
     """添加键值对表格"""
@@ -209,7 +362,6 @@ def _add_score_section(doc, score_data: dict, section_name: str):
     # 评分维度表
     dimensions = score_data.get("dimensions", {})
     if dimensions:
-        # dimensions 可能是 dict 或 list，统一转为 list
         if isinstance(dimensions, dict):
             dim_items = [(name, info) for name, info in dimensions.items()
                          if isinstance(info, dict)]
@@ -220,13 +372,11 @@ def _add_score_section(doc, score_data: dict, section_name: str):
             dim_items = []
         if dim_items:
             t = doc.add_table(rows=len(dim_items) + 1, cols=3, style="Light Grid Accent 1")
-            # 表头
             for j, header in enumerate(["维度", "得分", "评价"]):
                 t.rows[0].cells[j].text = header
                 for run in t.rows[0].cells[j].paragraphs[0].runs:
                     run.bold = True
                     run.font.size = Pt(9)
-            # 数据行
             for i, (name, info) in enumerate(dim_items):
                 t.rows[i + 1].cells[0].text = name
                 max_s = info.get("max_score", 25)
@@ -241,17 +391,627 @@ def _add_score_section(doc, score_data: dict, section_name: str):
 
     # 优势/不足/建议
     for label, key, color in [
-        ("✅ 优势", "strengths", RGBColor(0x00, 0x80, 0x00)),
-        ("⚠️ 不足", "weaknesses", RGBColor(0xCC, 0x33, 0x00)),
-        ("💡 改进建议", "suggestions", RGBColor(0x00, 0x78, 0xD4)),
+        ("优势", "strengths", COLOR_GREEN),
+        ("不足", "weaknesses", COLOR_RED),
+        ("改进建议", "suggestions", COLOR_BLUE),
     ]:
         items = score_data.get(key, [])
         if items:
+            _add_bullet_list(doc, label, items, color)
+
+
+def _add_audience_scenario_section(doc, as_score: dict):
+    """添加合并版人群与场景分析板块"""
+    total = as_score.get("total_score", 0)
+    p = doc.add_paragraph()
+    run = p.add_run(f"综合评分: {total}/100")
+    run.bold = True
+    run.font.size = Pt(11)
+    run.font.color.rgb = _score_color(total)
+
+    # 分析段落
+    analysis = as_score.get("analysis", {})
+    if analysis:
+        dim_labels = {
+            "audience_scene_fit": "人群-场景匹配度",
+            "insight_depth": "需求洞察深度",
+            "data_coverage": "数据支撑与覆盖度",
+            "commercial_value": "商业价值判断",
+        }
+        for key, label in dim_labels.items():
+            text = analysis.get(key, "")
+            if text:
+                p = doc.add_paragraph()
+                run = p.add_run(f"【{label}】")
+                run.bold = True
+                run.font.size = Pt(10.5)
+                doc.add_paragraph(text)
+
+    # 专家视角
+    expert = as_score.get("expert_analysis", {})
+    if expert:
+        p = doc.add_paragraph()
+        run = p.add_run("专家视角")
+        run.bold = True
+        run.font.size = Pt(11)
+        run.font.color.rgb = COLOR_BLUE
+
+        expert_items = []
+        if expert.get("target_audience"):
+            expert_items.append(("建议目标人群", expert["target_audience"]))
+        if expert.get("core_scenarios"):
+            expert_items.append(("建议核心场景", expert["core_scenarios"]))
+        if expert.get("key_suggestion"):
+            expert_items.append(("关键建议", expert["key_suggestion"]))
+        if expert_items:
+            _add_kv_table(doc, expert_items)
+
+    # 评分明细表
+    scores = as_score.get("scores", {})
+    if scores:
+        score_items = [(name, info) for name, info in scores.items()
+                       if isinstance(info, dict)]
+        if score_items:
+            t = doc.add_table(rows=len(score_items) + 1, cols=3, style="Light Grid Accent 1")
+            for j, header in enumerate(["维度", "得分", "结论"]):
+                t.rows[0].cells[j].text = header
+                for run in t.rows[0].cells[j].paragraphs[0].runs:
+                    run.bold = True
+                    run.font.size = Pt(9)
+            for i, (name, info) in enumerate(score_items):
+                t.rows[i + 1].cells[0].text = name
+                t.rows[i + 1].cells[1].text = f"{info.get('score', 0)}/25"
+                t.rows[i + 1].cells[2].text = info.get("reason", "")
+                for cell in t.rows[i + 1].cells:
+                    for paragraph in cell.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.size = Pt(9)
+                            run.font.name = "微软雅黑"
+                            run.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # 优势/不足/建议
+    for label, key, color in [
+        ("优势", "strengths", COLOR_GREEN),
+        ("不足", "weaknesses", COLOR_RED),
+        ("改进建议", "suggestions", COLOR_BLUE),
+    ]:
+        items = as_score.get(key, [])
+        if items:
+            _add_bullet_list(doc, label, items, color)
+
+
+def _add_vl_report_sections(doc, vl_report: dict):
+    """将VL对比拆解报告的详细内容输出到Word文档"""
+
+    # ── 模块对比分析 (section3) ──
+    section3 = vl_report.get("section3_module_comparison", {})
+    if section3:
+        p = doc.add_paragraph()
+        run = p.add_run("── 模块对比分析 ──")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        reuse_rate = section3.get("overall_reuse_rate", "?")
+        reuse_summary = section3.get("reuse_summary", "")
+        p = doc.add_paragraph()
+        run = p.add_run(f"整体复用率: {reuse_rate}%")
+        run.bold = True
+        if reuse_summary:
+            p.add_run(f"  |  {reuse_summary}")
+
+        same = section3.get("same_modules", [])
+        comp_only = section3.get("competitor_only", [])
+        own_only = section3.get("own_only", [])
+        structural = section3.get("structural_differences", [])
+
+        if same:
+            _add_bullet_list(doc, f"相同模块（可复用）: {len(same)}个",
+                             [f"{m.get('module_name','?')} | 自家: {str(m.get('own_detail',''))[:40]} | 竞品: {str(m.get('competitor_detail',''))[:40]}"
+                              for m in same[:8]], COLOR_GREEN, "✅")
+        if comp_only:
+            items = []
+            for m in comp_only[:8]:
+                hit = " ← 升级方向命中" if m.get("upgrade_direction_hit") else ""
+                items.append(f"{m.get('module_name','?')} | {str(m.get('detail',''))[:50]}{hit}")
+            _add_bullet_list(doc, f"竞品独有（需补齐）: {len(comp_only)}个", items, COLOR_RED, "🔴")
+        if own_only:
+            items = []
+            for m in own_only[:6]:
+                adv = " ✓ 优势" if m.get("is_advantage") else ""
+                items.append(f"{m.get('module_name','?')} | {str(m.get('detail',''))[:50]}{adv}")
+            _add_bullet_list(doc, f"自家独有（差异化）: {len(own_only)}个", items, COLOR_GREEN, "🟢")
+        if structural:
+            items = []
+            for s in structural[:4]:
+                items.append(f"{s.get('aspect','?')} | 自家: {str(s.get('own',''))[:30]} | 竞品: {str(s.get('competitor',''))[:30]}")
+            _add_bullet_list(doc, f"结构差异: {len(structural)}处", items, COLOR_GRAY, "⚡")
+
+    # ── 升级方向评估 (section4) ──
+    dir_score = vl_report.get("section4_upgrade_direction_score", {})
+    if dir_score:
+        p = doc.add_paragraph()
+        run = p.add_run("── 升级方向评估 ──")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        quality = dir_score.get("direction_quality", "?")
+        quality_color = COLOR_GREEN if quality == "精准" else (RGBColor(0xFF, 0x99, 0x00) if quality == "部分命中" else COLOR_RED)
+        p = doc.add_paragraph()
+        run = p.add_run(f"方向评估: {quality}")
+        run.bold = True
+        run.font.color.rgb = quality_color
+
+        dir_items = []
+        hit_mods = dir_score.get("direction_hit_modules", [])
+        miss_mods = dir_score.get("direction_miss_modules", [])
+        if hit_mods:
+            dir_items.append(("命中模块", ", ".join(str(m) for m in hit_mods[:5])))
+        if miss_mods:
+            dir_items.append(("未命中模块", ", ".join(str(m) for m in miss_mods[:5])))
+        if dir_score.get("reason"):
+            dir_items.append(("评估理由", dir_score["reason"]))
+        if dir_items:
+            _add_kv_table(doc, dir_items)
+
+    # ── 模块复用分析 (section5) ──
+    reuse_data = vl_report.get("section5_module_reuse", {})
+    if reuse_data:
+        p = doc.add_paragraph()
+        run = p.add_run("── 模块复用分析 ──")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        overall_rate = reuse_data.get("overall_reuse_rate", "?")
+        core_rate = reuse_data.get("core_module_reuse_rate", "?")
+        new_modules = reuse_data.get("new_modules_needed", [])
+        reuse_summary = reuse_data.get("reuse_summary", "")
+
+        p = doc.add_paragraph()
+        run = p.add_run(f"整体复用率: {overall_rate}%  |  核心模块复用率: {core_rate}%")
+        run.bold = True
+
+        if new_modules:
             p = doc.add_paragraph()
-            run = p.add_run(label)
+            p.add_run(f"需新增模块: {', '.join(str(m) for m in new_modules[:5])}")
+
+        reuse_analysis = reuse_data.get("reuse_analysis", [])
+        if reuse_analysis:
+            items = [f"{ra.get('module','?')} — 复用度: {ra.get('reusability','?')} | {str(ra.get('reason',''))[:60]}"
+                     for ra in reuse_analysis[:6]]
+            _add_bullet_list(doc, "逐模块复用评估", items, COLOR_BLUE, "")
+
+        if reuse_summary:
+            doc.add_paragraph(f"总结: {reuse_summary}")
+
+    # ── 升级增量价值 (section6) ──
+    value_data = vl_report.get("section6_upgrade_value", {})
+    if value_data:
+        p = doc.add_paragraph()
+        run = p.add_run("── 升级增量价值 ──")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        inc_modules = value_data.get("incremental_modules", [])
+        perception = value_data.get("user_perception", "?")
+        price_comp = value_data.get("price_competitiveness", "")
+        value_summary = value_data.get("value_summary", "")
+
+        val_items = [
+            ("新增模块", ", ".join(str(m) for m in inc_modules[:5]) if inc_modules else "无"),
+            ("用户感知", perception),
+        ]
+        if price_comp:
+            val_items.append(("价格竞争力", price_comp[:80]))
+        _add_kv_table(doc, val_items)
+
+        if value_summary:
+            doc.add_paragraph(f"总结: {value_summary}")
+
+    # ── 执行可行性 (section7) ──
+    feas_data = vl_report.get("section7_execution_feasibility", {})
+    if feas_data:
+        p = doc.add_paragraph()
+        run = p.add_run("── 执行可行性 ──")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        proto_days = feas_data.get("prototype_days", "?")
+        process_diff = feas_data.get("process_difficulty", "?")
+        supply_risk = feas_data.get("supply_chain_risk", "?")
+        is_new_cat = feas_data.get("is_new_category", False)
+        new_processes = feas_data.get("new_process_needed", [])
+        feas_summary = feas_data.get("feasibility_summary", "")
+
+        feas_items = [
+            ("打样周期", f"{proto_days}天"),
+            ("工艺难度", process_diff),
+            ("供应链风险", supply_risk),
+        ]
+        if is_new_cat:
+            feas_items.append(("新品类", "是（额外供应链风险）"))
+        if new_processes:
+            feas_items.append(("需新开工艺", ", ".join(str(p) for p in new_processes[:5])))
+        _add_kv_table(doc, feas_items)
+
+        if feas_summary:
+            doc.add_paragraph(f"总结: {feas_summary}")
+
+    # ── 下一步建议 (section9) ──
+    next_steps = vl_report.get("section9_next_steps", {})
+    if next_steps:
+        suggestions = next_steps.get("suggestions", [])
+        summary = next_steps.get("summary", "")
+        if suggestions:
+            _add_bullet_list(doc, "下一步建议", suggestions[:5], COLOR_BLUE, "💡")
+        if summary:
+            doc.add_paragraph(f"综合建议: {summary}")
+
+
+def _add_module_comparison_table(doc, module_comparison: list[dict]):
+    """
+    将逐模块差距矩阵渲染为 Word 表格。
+    列：模块名称 | 我方状态 | 竞品/参考 | 差距等级 | 用户感知 | 优先级 | 建议
+    """
+    if not module_comparison:
+        return
+
+    headers = ["模块", "我方状态", "竞品/参考", "差距", "感知", "优先级", "建议"]
+    num_cols = len(headers)
+    num_rows = len(module_comparison) + 1
+
+    table = doc.add_table(rows=num_rows, cols=num_cols, style="Light Grid Accent 1")
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+
+    # 表头
+    for j, header in enumerate(headers):
+        cell = table.rows[0].cells[j]
+        cell.text = header
+        for run in cell.paragraphs[0].runs:
             run.bold = True
-            run.font.color.rgb = color
-            for item in items:
-                bullet = doc.add_paragraph(item, style="List Bullet")
-                for run in bullet.runs:
-                    run.font.size = Pt(10)
+            run.font.size = Pt(9)
+            run.font.name = "微软雅黑"
+            run.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # 数据行
+    for i, mc in enumerate(module_comparison):
+        row = table.rows[i + 1]
+        values = [
+            mc.get("module_name", ""),
+            mc.get("our_status", ""),
+            mc.get("competitor_status", ""),
+            mc.get("gap_level", ""),
+            mc.get("user_perception", ""),
+            mc.get("upgrade_priority", ""),
+            mc.get("suggestion", ""),
+        ]
+        for j, val in enumerate(values):
+            cell = row.cells[j]
+            cell.text = str(val)
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(9)
+                    run.font.name = "微软雅黑"
+                    run.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+            # 差距列着色
+            if j == 3 and val in GAP_COLORS:
+                for run in cell.paragraphs[0].runs:
+                    run.font.color.rgb = GAP_COLORS[val]
+                    run.bold = True
+
+            # 优先级列着色
+            if j == 5:
+                priority_colors = {
+                    "P0": COLOR_RED,
+                    "P1": RGBColor(0xFF, 0x99, 0x00),
+                    "P2": COLOR_BLUE,
+                    "P3": COLOR_GRAY,
+                }
+                if val in priority_colors:
+                    for run in cell.paragraphs[0].runs:
+                        run.font.color.rgb = priority_colors[val]
+                        run.bold = True
+
+    # 设置列宽
+    try:
+        widths = [Cm(2.0), Cm(2.5), Cm(2.5), Cm(1.2), Cm(1.2), Cm(1.2), Cm(4.5)]
+        for row in table.rows:
+            for j, width in enumerate(widths):
+                row.cells[j].width = width
+    except Exception:
+        pass  # 列宽设置失败不影响输出
+
+
+def _add_roadmap_table(doc, roadmap: list[dict]):
+    """将升级路线图渲染为 Word 表格"""
+    if not roadmap:
+        return
+
+    headers = ["优先级", "模块/方向", "具体行动", "预期效果"]
+    num_cols = len(headers)
+    num_rows = len(roadmap) + 1
+
+    table = doc.add_table(rows=num_rows, cols=num_cols, style="Light Grid Accent 1")
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    # 表头
+    for j, header in enumerate(headers):
+        cell = table.rows[0].cells[j]
+        cell.text = header
+        for run in cell.paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(9)
+
+    # 数据行
+    priority_colors = {
+        "P0": COLOR_RED,
+        "P1": RGBColor(0xFF, 0x99, 0x00),
+        "P2": COLOR_BLUE,
+        "P3": COLOR_GRAY,
+    }
+    for i, item in enumerate(roadmap):
+        row = table.rows[i + 1]
+        values = [
+            item.get("priority", ""),
+            item.get("module_name", item.get("direction", "")),
+            item.get("action", item.get("suggestion", "")),
+            item.get("expected_effect", item.get("reason", "")),
+        ]
+        for j, val in enumerate(values):
+            cell = row.cells[j]
+            cell.text = str(val)
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(9)
+                    run.font.name = "微软雅黑"
+                    run.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+            # 优先级列着色
+            if j == 0 and val in priority_colors:
+                for run in cell.paragraphs[0].runs:
+                    run.font.color.rgb = priority_colors[val]
+                    run.bold = True
+
+
+def _add_summary_section(doc, summary: dict):
+    """添加分析摘要（优势/不足/复用/新建）"""
+    sections = [
+        ("我方优势", "our_strengths"),
+        ("我方不足", "our_weaknesses"),
+        ("可复用模块", "reuse_modules"),
+        ("需新建模块", "new_modules_needed"),
+    ]
+    for label, key in sections:
+        items = summary.get(key, [])
+        if items:
+            color = COLOR_GREEN if key in ("our_strengths", "reuse_modules") else COLOR_RED
+            _add_bullet_list(doc, label, items, color)
+
+
+def _add_bullet_list(doc, label: str, items: list, color: RGBColor, prefix: str = ""):
+    """添加带标题的要点列表"""
+    p = doc.add_paragraph()
+    display_label = f"{prefix} {label}" if prefix else label
+    run = p.add_run(display_label)
+    run.bold = True
+    run.font.color.rgb = color
+
+    for item in items:
+        bullet = doc.add_paragraph(str(item), style="List Bullet")
+        for run in bullet.runs:
+            run.font.size = Pt(10)
+
+
+def _extract_module_comparison(specific_analysis: dict) -> list[dict]:
+    """从专项分析结果中提取 module_comparison"""
+    if not specific_analysis:
+        return []
+
+    # 1. 可能在顶层
+    mc = specific_analysis.get("module_comparison", [])
+    if mc:
+        return mc
+
+    # 2. 可能在 comparison 子对象中
+    comparison = specific_analysis.get("comparison", {})
+    if isinstance(comparison, dict):
+        mc = comparison.get("module_comparison", [])
+        if mc:
+            return mc
+
+        # 品类缺失V2: module_reuse_detail 格式转换
+        mrd = comparison.get("module_reuse_detail", [])
+        if mrd:
+            rows = []
+            for m in mrd:
+                rows.append({
+                    "module_name": m.get("module_name", ""),
+                    "our_status": m.get("source", ""),
+                    "competitor_status": m.get("note", ""),
+                    "gap_level": {"相同": "无", "相似": "低", "需改造": "中", "需新建": "高"}.get(m.get("match_level", ""), "中"),
+                    "user_perception": "",
+                    "upgrade_priority": "",
+                    "suggestion": f"{m.get('match_level', '')} ({m.get('module_type', '')})",
+                })
+            return rows
+
+    # 3. 可能在 vl_report.section3_module_comparison（VL对比拆解结果）
+    vl_report = specific_analysis.get("vl_report", {})
+    if isinstance(vl_report, dict):
+        section3 = vl_report.get("section3_module_comparison", {})
+        if isinstance(section3, dict):
+            # 转换section3为表格格式
+            rows = []
+            # 相同模块
+            for m in section3.get("same_modules", []):
+                rows.append({
+                    "module_name": m.get("module_name", ""),
+                    "our_status": m.get("own_detail", ""),
+                    "competitor_status": m.get("competitor_detail", ""),
+                    "gap_level": "无",
+                    "user_perception": "",
+                    "upgrade_priority": "",
+                    "suggestion": "复用现有模块" if m.get("reuse") else "可复用",
+                })
+            # 竞品独有
+            for m in section3.get("competitor_only", []):
+                hit = m.get("upgrade_direction_hit", False)
+                rows.append({
+                    "module_name": m.get("module_name", ""),
+                    "our_status": "缺失",
+                    "competitor_status": m.get("detail", ""),
+                    "gap_level": "高",
+                    "user_perception": "",
+                    "upgrade_priority": "P0" if hit else "P1",
+                    "suggestion": "需新建或升级" + (" ← 升级方向命中" if hit else ""),
+                })
+            # 自家独有
+            for m in section3.get("own_only", []):
+                rows.append({
+                    "module_name": m.get("module_name", ""),
+                    "our_status": m.get("detail", ""),
+                    "competitor_status": "缺失",
+                    "gap_level": "无",
+                    "user_perception": "",
+                    "upgrade_priority": "",
+                    "suggestion": "自家差异化优势" if m.get("is_advantage") else "保持",
+                })
+            # 结构差异
+            for s in section3.get("structural_differences", []):
+                rows.append({
+                    "module_name": s.get("aspect", ""),
+                    "our_status": s.get("own", ""),
+                    "competitor_status": s.get("competitor", ""),
+                    "gap_level": "中",
+                    "user_perception": "",
+                    "upgrade_priority": "P2",
+                    "suggestion": "需评估工艺差异",
+                })
+            if rows:
+                return rows
+
+    return []
+
+
+def _extract_roadmap(specific_analysis: dict) -> list[dict]:
+    """从专项分析结果中提取 upgrade_roadmap"""
+    if not specific_analysis:
+        return []
+
+    roadmap = specific_analysis.get("upgrade_roadmap", [])
+    if roadmap:
+        return roadmap
+
+    comparison = specific_analysis.get("comparison", {})
+    if isinstance(comparison, dict):
+        roadmap = comparison.get("upgrade_roadmap", [])
+        if roadmap:
+            return roadmap
+
+    # 从 vl_report 的 next_steps 和 competitor_only 提取
+    vl_report = specific_analysis.get("vl_report", {})
+    if isinstance(vl_report, dict):
+        roadmap_items = []
+
+        # 竞品独有模块 → P0/P1 行动项
+        section3 = vl_report.get("section3_module_comparison", {})
+        for m in section3.get("competitor_only", []):
+            hit = m.get("upgrade_direction_hit", False)
+            roadmap_items.append({
+                "priority": "P0" if hit else "P1",
+                "module_name": m.get("module_name", ""),
+                "action": f"补齐竞品独有模块: {m.get('detail', '')[:60]}",
+                "expected_effect": "缩小与竞品差距" if hit else "提升产品竞争力",
+            })
+
+        # next_steps.suggestions
+        next_steps = vl_report.get("section9_next_steps", {})
+        for s in next_steps.get("suggestions", [])[:3]:
+            roadmap_items.append({
+                "priority": "P2",
+                "module_name": "综合建议",
+                "action": s,
+                "expected_effect": "",
+            })
+
+        if roadmap_items:
+            return roadmap_items
+
+    return []
+
+
+def _extract_summary(specific_analysis: dict) -> dict:
+    """从专项分析结果中提取 summary"""
+    if not specific_analysis:
+        return {}
+
+    summary = specific_analysis.get("summary", {})
+    if summary:
+        return summary
+
+    comparison = specific_analysis.get("comparison", {})
+    if isinstance(comparison, dict):
+        summary = comparison.get("summary", {})
+        if summary:
+            return summary
+
+    # 从 vl_report 构建摘要
+    vl_report = specific_analysis.get("vl_report", {})
+    if isinstance(vl_report, dict):
+        result = {}
+        section3 = vl_report.get("section3_module_comparison", {})
+        reuse_data = vl_report.get("section5_module_reuse", {})
+
+        same = [m.get("module_name", "") for m in section3.get("same_modules", [])]
+        comp_only = [m.get("module_name", "") for m in section3.get("competitor_only", [])]
+        own_only = [m.get("module_name", "") for m in section3.get("own_only", [])]
+        new_mods = reuse_data.get("new_modules_needed", [])
+
+        if own_only:
+            result["our_strengths"] = own_only
+        if comp_only:
+            result["our_weaknesses"] = comp_only
+        if same:
+            result["reuse_modules"] = same
+        if new_mods:
+            result["new_modules_needed"] = [str(m) for m in new_mods]
+
+        if result:
+            return result
+
+    return {}
+
+
+def _extract_design_requirements(report_text: str) -> str:
+    """从报告文本中提取设计要求段落"""
+    if not report_text:
+        return ""
+
+    lines = report_text.split("\n")
+    capturing = False
+    captured = []
+
+    for line in lines:
+        stripped = line.strip()
+        if "附" in stripped and "设计" in stripped:
+            capturing = True
+            continue
+        if capturing:
+            if stripped.startswith(("一、", "二、", "三、", "四、", "五、", "六、")):
+                break
+            if stripped and not stripped.startswith("====") and not stripped.startswith("----"):
+                captured.append(stripped)
+
+    return "\n".join(captured)
+
+
+def _get_specific_total(specific_score: dict) -> int:
+    """从专项评分中获取总分"""
+    if not specific_score:
+        return 0
+    if isinstance(specific_score, dict):
+        return specific_score.get("total_score", 0)
+    if hasattr(specific_score, "total_score"):
+        return specific_score.total_score
+    return 0

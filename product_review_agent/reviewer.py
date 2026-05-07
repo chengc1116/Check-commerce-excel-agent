@@ -80,6 +80,73 @@ def _build_scenario_prompt(text: str) -> str:
     )
 
 
+def _build_audience_scenario_prompt(
+    audience_text: str,
+    scenario_text: str,
+    product_context: dict,
+) -> str:
+    """构建合并版人群+场景分析报告 prompt"""
+    product_name = product_context.get("product_name", "未知")
+    brand = product_context.get("brand", "未知")
+    category_l1 = product_context.get("category_l1", "")
+    category_l2 = product_context.get("category_l2", "")
+    category_l3 = product_context.get("category_l3", "")
+    pricing = product_context.get("pricing", "未填写")
+    estimated_sales = product_context.get("estimated_sales", "未填写")
+
+    return (
+        '【任务】对以下产品立项的"人群与场景分析"数据撰写审核报告。'
+        '你不仅是评审者，更是顾问——如果项目方的人群与场景分析存在偏差或遗漏，'
+        '你需要基于产品品类和常识给出你认为正确的人群与场景分析，作为项目方的参考标杆。\n'
+        '【规则】只返回一个合法的JSON对象，不要输出任何其他文字、解释或markdown格式。\n\n'
+        f'【产品信息】\n'
+        f'产品名称：{product_name}\n'
+        f'品牌：{brand}\n'
+        f'品类：{category_l1} > {category_l2} > {category_l3}\n'
+        f'定价：{pricing}\n'
+        f'目标销量：{estimated_sales}\n\n'
+        f'【项目方提交的人群数据】\n{audience_text}\n\n'
+        f'【项目方提交的场景数据】\n{scenario_text}\n\n'
+        '【分析要求】\n'
+        '1. 不要只给分数和一句话理由，要写出具体的分析过程和发现\n'
+        '2. 要引用项目方数据中的具体内容，而非笼统概括\n'
+        '3. 人群和场景要交叉分析：哪些人群对应哪些场景、是否存在断层\n'
+        '4. 如果项目方的人群或场景有明显偏差、遗漏、不合理，你需要给出自己的分析'
+        '——这类产品真正应该关注哪些人群、哪些核心场景\n'
+        '5. 评分是基于分析结论的自然结果，不是先给分再凑理由\n\n'
+        '【输出格式】严格按此JSON结构输出：\n'
+        '{\n'
+        '  "analysis": {\n'
+        '    "audience_scene_fit": "人群-场景匹配度分析（150-250字）：项目方定义的核心人群是谁，主要场景是什么，'
+        '人群特征是否自然导向场景需求，是否存在人群与场景不匹配或缺失关键场景的情况，引用数据具体说明",\n'
+        '    "insight_depth": "需求洞察深度分析（150-250字）：从人群痛点推导到场景需求的逻辑链是否完整，'
+        '痛点是否具体可操作（对比"需要好产品"式空话），哪些洞察有说服力、哪些流于表面",\n'
+        '    "data_coverage": "数据支撑与覆盖度分析（150-250字）：人群是否有量化画像，场景是否有优先级排序，'
+        '是否存在纯定性无数据支撑的部分，覆盖面是否有明显遗漏",\n'
+        '    "commercial_value": "商业价值判断分析（150-250字）：场景是否有频次/规模/付费意愿评估，'
+        '人群细分是否有主次和商业优先级，人-场景组合指向什么样的市场机会"\n'
+        '  },\n'
+        '  "expert_analysis": {\n'
+        '    "target_audience": "基于该品类和产品特征，你认为正确的目标人群分析（100-200字）：核心人群是谁'
+        '（年龄/性别/职业/消费特征），次要人群是谁，与项目方定义的差异在哪里",\n'
+        '    "core_scenarios": "基于该品类和产品特征，你认为正确的核心使用场景（100-200字）：'
+        'TOP3场景及优先级理由，每个场景下的核心需求是什么，与项目方定义的差异在哪里",\n'
+        '    "key_suggestion": "人群与场景方面最关键的一条建议（50-100字）：如果项目方只能改一件事，应该改什么"\n'
+        '  },\n'
+        '  "scores": {\n'
+        '    "人群-场景匹配度": {"score": 20, "reason": "一句话结论"},\n'
+        '    "需求洞察深度": {"score": 18, "reason": "一句话结论"},\n'
+        '    "数据支撑与覆盖度": {"score": 19, "reason": "一句话结论"},\n'
+        '    "商业价值判断": {"score": 18, "reason": "一句话结论"}\n'
+        '  },\n'
+        '  "total_score": 75,\n'
+        '  "strengths": ["具体优势1（附数据引用）", "具体优势2"],\n'
+        '  "weaknesses": ["具体不足1（附数据引用）", "具体不足2"],\n'
+        '  "suggestions": ["具体建议1（可操作）", "具体建议2", "具体建议3"]\n'
+        '}'
+    )
+
+
 def _build_competitive_prompt(project_data: dict) -> str:
     """构建九宫格目标评分prompt"""
     competitor_name = project_data.get("competitor_name", "未知")
@@ -143,6 +210,7 @@ def _fallback_score(label: str, reason: str = "unknown") -> dict:
     dim_map = {
         "audience": ["目标人群明确性", "数据支撑度", "痛点分析深度", "细分合理性"],
         "scenario": ["核心场景清晰度", "场景覆盖完整性", "问题需求分析", "场景价值评估"],
+        "audience_scenario": ["人群-场景匹配度", "需求洞察深度", "数据支撑与覆盖度", "商业价值判断"],
         "competitive": ["信息完整度", "数据严谨性", "逻辑自洽性", "分析深度"],
     }
     dims = dim_map.get(label, dim_map["audience"])
@@ -210,6 +278,8 @@ async def ascore_with_llm(
         prompt = _build_audience_prompt(text)
     elif field_type == "scenario":
         prompt = _build_scenario_prompt(text)
+    elif field_type == "audience_scenario":
+        prompt = text  # 已由调用方构建好的完整prompt
     elif field_type == "competitive":
         prompt = extra_context
     else:
