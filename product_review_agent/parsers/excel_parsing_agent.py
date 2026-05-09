@@ -29,11 +29,12 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-os.chdir(PROJECT_ROOT)
+sys.path.insert(0, str(PROJECT_ROOT.parent))
+os.chdir(PROJECT_ROOT.parent)
 
 from dotenv import load_dotenv
-load_dotenv(PROJECT_ROOT / ".env", override=True)
+# .env 在项目根目录（PROJECT_ROOT的父目录），而非product_review_agent目录
+load_dotenv(PROJECT_ROOT.parent / ".env", override=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -333,39 +334,12 @@ async def parse_excel_to_project_review(file_path: str, task_type: str = "") -> 
 
 
 def _adapt_hot_upgrade(data: dict) -> dict:
-    """爆品升级适配层：将新Prompt字段映射为下游analyzer/pipeline/reviewer期望的格式"""
+    """爆品升级适配层：仅做必要的字段转换，不重复搬运"""
     adapted = dict(data)
 
-    # 群体分析 → used_people / used_scene / target_audience / target_scenario
-    people_analysis = data.get("people_analysis", "")
-    scene_analysis = data.get("scene_analysis", "")
-    group_extra = data.get("group_extra", "")
-
-    if people_analysis:
-        adapted["used_people"] = [{"raw_text": people_analysis}]
-        adapted["target_audience"] = people_analysis
-    if scene_analysis:
-        adapted["used_scene"] = [{"raw_text": scene_analysis}]
-        adapted["target_scenario"] = scene_analysis
-    if group_extra:
-        adapted["group_extra_text"] = group_extra
-
-    # 设计要求扁平字段 → design_require 对象
-    design_require = {}
-    if data.get("design_purpose"):
-        design_require["content"] = data["design_purpose"]
-    if data.get("outlook"):
-        design_require["outlook"] = data["outlook"]
-    if data.get("material"):
-        design_require["material"] = data["material"]
-    if data.get("function"):
-        design_require["function"] = data["function"]
-    if design_require:
-        adapted["design_require"] = design_require
-
-    # upgrade_function ← function（analyzer用upgrade_function）
-    if data.get("function") and not data.get("upgrade_function"):
-        adapted["upgrade_function"] = data["function"]
+    # group_extra → group_extra_text（下游字段名不同）
+    if data.get("group_extra"):
+        adapted["group_extra_text"] = data["group_extra"]
 
     # pricing里提取gfm（毛利率）
     pricing = data.get("pricing", "")
@@ -375,9 +349,18 @@ def _adapt_hot_upgrade(data: dict) -> dict:
         if m:
             adapted["gfm"] = int(m.group(1))
 
-    # erp_cost → ERP_price
+    # erp_cost → ERP_price（下游字段名不同）
     if data.get("erp_cost") and not data.get("ERP_price"):
         adapted["ERP_price"] = data["erp_cost"]
+
+    # 竞品信息 → product_comparison 对象（docx_generator读这个字段）
+    if data.get("competitor_price") or data.get("competitor_url"):
+        comparison = adapted.get("product_comparison", {})
+        if data.get("competitor_price"):
+            comparison["competitor_price"] = data["competitor_price"]
+        if data.get("competitor_url"):
+            comparison["comparison_url"] = data["competitor_url"]
+        adapted["product_comparison"] = comparison
 
     return adapted
 
@@ -470,10 +453,17 @@ async def main():
 
     if not args or "--help" in args or "-h" in args:
         print("""
-用法: python scripts/excel_parsing_agent.py <xlsx文件路径>
+用法: python product_review_agent/parsers/excel_parsing_agent.py <xlsx文件路径> [--type 立项类型]
 
 示例:
-  python scripts/excel_parsing_agent.py data/excel/xxx.xlsx
+  python product_review_agent/parsers/excel_parsing_agent.py data/excel/xxx.xlsx --type hot_upgrade
+
+立项类型:
+  hot_upgrade       爆品升级
+  category_gap      品类缺失
+  competitor_upgrade 竞品升级
+  low_sale_iterate   低销迭代
+  (不指定则使用通用模板)
 
 说明:
   一次性将前4个sheet传入LLM，用语义理解自动映射到数据库字段。
@@ -482,12 +472,17 @@ async def main():
         return
 
     file_path = args[0]
+    task_type = ""
+    if "--type" in args:
+        idx = args.index("--type")
+        if idx + 1 < len(args):
+            task_type = args[idx + 1]
 
     print("\n" + "=" * 55)
     print("   Excel解析Agent — 项目书→结构化JSON")
     print("=" * 55 + "\n")
 
-    result = await parse_excel_to_project_review(file_path)
+    result = await parse_excel_to_project_review(file_path, task_type=task_type)
 
     # 保存JSON
     output_dir = PROJECT_ROOT / "output"

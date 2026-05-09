@@ -18,6 +18,11 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path as _Path
+from dotenv import load_dotenv
+load_dotenv(_Path(__file__).resolve().parent.parent / ".env", override=True)
+
 import asyncio
 import json
 import logging
@@ -185,8 +190,8 @@ def _extract_basic_info(project_data: dict) -> dict:
         "gfm": project_data.get("gfm", ""),
         "ERP_price": project_data.get("ERP_price", ""),
         "core_config": project_data.get("core_config", ""),
-        "design_require": project_data.get("design_require", {}),
-        "product_comparison": project_data.get("product_comparison", {}),
+        "design_require": project_data.get("design_require") or {"content": project_data.get("design_purpose", "")},
+        "product_comparison": project_data.get("product_comparison") or {"competitor_price": project_data.get("competitor_price", "")},
     }
 
 
@@ -202,14 +207,14 @@ async def _score_audience_scenario(project_data: dict) -> dict:
     if used_people:
         audience_text = json.dumps(used_people, ensure_ascii=False, indent=2)
     else:
-        audience_text = ""
+        audience_text = project_data.get("people_analysis", "")
 
     # 提取场景文本
     used_scene = project_data.get("used_scene", [])
     if used_scene:
         scenario_text = json.dumps(used_scene, ensure_ascii=False, indent=2)
     else:
-        scenario_text = project_data.get("usage_scenarios", "")
+        scenario_text = project_data.get("scene_analysis", "") or project_data.get("usage_scenarios", "")
 
     # 两者都为空则回退
     has_audience = bool(audience_text) and not ("[图片" in audience_text and len(audience_text.strip()) < 50)
@@ -599,36 +604,17 @@ def _generate_report(
     lines.append("六、综合评估")
     lines.append(THIN_SEP)
 
-    # 计算综合分（按任务类型区分权重）
-    # 爆品升级：人群场景0.2 + 专项0.8
-    # 其他类型：人群场景0.4 + 专项0.6
-    if task_type == "hot_upgrade":
-        weights = {"人群与场景": 0.2, "专项": 0.8}
-    else:
-        weights = {"人群与场景": 0.4, "专项": 0.6}
-
-    valid_scores = []
-    if as_total > 0:
-        valid_scores.append(("人群与场景", as_total, weights["人群与场景"]))
-
-    # 专项分析得分
+    # 综合分 = 专项分析得分（人群场景仅做分析，不纳入评分）
     specific_total = 0
     if specific_score and isinstance(specific_score, object) and hasattr(specific_score, "total_score"):
         specific_total = specific_score.total_score
-        valid_scores.append(("专项", specific_total, weights["专项"]))
     elif specific_score and isinstance(specific_score, dict):
         specific_total = specific_score.get("total_score", 0)
-        valid_scores.append(("专项", specific_total, weights["专项"]))
 
-    overall = 0
+    overall = specific_total
     risk = "未知"
-    if valid_scores:
-        total_weight = sum(w for _, _, w in valid_scores)
-        if total_weight > 0:
-            overall = int(round(sum(s * w / total_weight for _, s, w in valid_scores)))
-
-        for name, score, weight in valid_scores:
-            lines.append(f"  {name}评分: {score}/100 (权重{weight:.0%})")
+    if overall > 0:
+        lines.append(f"  专项评分: {overall}/100")
         lines.append(f"  综合评分: {overall}/100")
         lines.append(f"  星级: [{_stars_display(_score_stars(overall))}]")
 
@@ -646,18 +632,22 @@ def _generate_report(
 
     # 设计要求
     design_req = basic.get("design_require", {})
+    if not design_req and project_data.get("design_purpose"):
+        design_req = {"content": project_data["design_purpose"]}
+        if project_data.get("upgrade_modules"):
+            design_req["upgrade_modules"] = project_data["upgrade_modules"]
+        if project_data.get("upgrade_valiable"):
+            design_req["upgrade_valiable"] = project_data["upgrade_valiable"]
     if design_req:
         lines.append(THIN_SEP)
         lines.append("附、设计要求")
         lines.append(THIN_SEP)
         if design_req.get("content"):
             lines.append(f"  设计目的: {design_req['content']}")
-        if design_req.get("outlook"):
-            lines.append(f"  改外观/品牌: {design_req['outlook']}")
-        if design_req.get("material"):
-            lines.append(f"  改材料: {design_req['material']}")
-        if design_req.get("function"):
-            lines.append(f"  改功能: {design_req['function']}")
+        if design_req.get("upgrade_modules"):
+            lines.append(f"  升级模块: {design_req['upgrade_modules']}")
+        if design_req.get("upgrade_valiable"):
+            lines.append(f"  升级可行性: {design_req['upgrade_valiable']}")
         lines.append("")
 
     lines.append(SEPARATOR)
@@ -788,16 +778,10 @@ async def run_pipeline(file_path: str, task_type: str) -> PipelineResult:
         task_label=f"{task_emoji} {task_label}",
     )
 
-    # 计算综合分（按任务类型区分权重）
-    if task_type == "hot_upgrade":
-        weights = {"人群与场景": 0.2, "专项": 0.8}
-    else:
-        weights = {"人群与场景": 0.4, "专项": 0.6}
+    # 综合分 = 专项分析得分（人群场景仅做分析，不纳入评分）
     valid_scores = []
-    if as_total > 0:
-        valid_scores.append(("人群与场景", as_total, weights["人群与场景"]))
     if specific_total > 0:
-        valid_scores.append(("专项", specific_total, weights["专项"]))
+        valid_scores.append(("专项", specific_total, 1.0))
 
     overall = 0
     risk = "未知"

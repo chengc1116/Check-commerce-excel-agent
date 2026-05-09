@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    category_l1     TEXT,
-    category_l2     TEXT,
-    category_l3     TEXT,
+    category1     TEXT,
+    category2     TEXT,
+    category3     TEXT,
     version         TEXT,
     brand           TEXT,
     sku             TEXT NOT NULL,
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS products (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sku_brand ON products(sku, brand);
-CREATE INDEX IF NOT EXISTS idx_category_l2 ON products(category_l2);
+CREATE INDEX IF NOT EXISTS idx_category2 ON products(category2);
 CREATE INDEX IF NOT EXISTS idx_brand ON products(brand);
 CREATE INDEX IF NOT EXISTS idx_status ON products(status);
 
@@ -101,9 +101,24 @@ class ProductDB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        # 检测 products 表实际的货号列名（可能是 sku 或 product_code）
+        self._sku_col = self._detect_sku_column()
         # 检测是否有 CBB 模块表
         self._has_cbb = self._check_cbb_tables()
-        logger.debug(f"[ProductDB] 已连接: {db_path}, has_cbb={self._has_cbb}")
+        logger.debug(f"[ProductDB] 已连接: {db_path}, sku_col={self._sku_col}, has_cbb={self._has_cbb}")
+
+    def _detect_sku_column(self) -> str:
+        """检测 products 表中货号列的实际名称"""
+        try:
+            cursor = self.conn.execute("PRAGMA table_info(products)")
+            cols = {r[1] for r in cursor.fetchall()}
+            if "product_code" in cols:
+                return "product_code"
+            if "sku" in cols:
+                return "sku"
+        except Exception:
+            pass
+        return "sku"  # 降级
 
     def _init_schema(self):
         """初始化表结构（逐条执行，跳过旧表不兼容的索引）"""
@@ -145,7 +160,7 @@ class ProductDB:
             # 更新已有记录
             sets = []
             params = []
-            for key in ["category_l1", "category_l2", "category_l3", "version", "image_path", "status"]:
+            for key in ["category1", "category2", "category3", "version", "image_path", "status"]:
                 if key in data and data[key] is not None:
                     sets.append(f"{key} = ?")
                     params.append(data[key])
@@ -154,21 +169,21 @@ class ProductDB:
                 params.append(now)
                 params.append(data["sku"])
                 params.append(data.get("brand", ""))
-                sql = f"UPDATE products SET {', '.join(sets)} WHERE sku = ? AND brand = ?"
+                sql = f"UPDATE products SET {', '.join(sets)} WHERE {self._sku_col} = ? AND brand = ?"
                 self.conn.execute(sql, params)
                 self.conn.commit()
                 logger.debug(f"[ProductDB] 更新产品: {data['sku']} ({data.get('brand', '')})")
                 return existing["id"]
         else:
             # 插入新记录
-            sql = """
-                INSERT INTO products (category_l1, category_l2, category_l3, version, brand, sku, image_path, status, created_at, updated_at)
+            sql = f"""
+                INSERT INTO products (category1, category2, category3, version, brand, {self._sku_col}, image_path, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             params = [
-                data.get("category_l1"),
-                data.get("category_l2"),
-                data.get("category_l3"),
+                data.get("category1"),
+                data.get("category2"),
+                data.get("category3"),
                 data.get("version"),
                 data.get("brand"),
                 data["sku"],
@@ -185,9 +200,10 @@ class ProductDB:
         """更新产品信息"""
         sets = []
         params = []
-        for key in ["category_l1", "category_l2", "category_l3", "version", "brand", "sku", "image_path", "status"]:
+        for key in ["category1", "category2", "category3", "version", "brand", "sku", "image_path", "status"]:
             if key in data:
-                sets.append(f"{key} = ?")
+                col = self._sku_col if key == "sku" else key
+                sets.append(f"{col} = ?")
                 params.append(data[key])
         if not sets:
             return False
@@ -205,12 +221,12 @@ class ProductDB:
 
     def get_product_by_sku(self, sku: str) -> dict | None:
         """按货号获取产品（返回第一条匹配）"""
-        row = self.conn.execute("SELECT * FROM products WHERE sku = ? LIMIT 1", (sku,)).fetchone()
+        row = self.conn.execute(f"SELECT * FROM products WHERE {self._sku_col} = ? LIMIT 1", (sku,)).fetchone()
         return dict(row) if row else None
 
     def get_product_by_sku_brand(self, sku: str, brand: str) -> dict | None:
         """按货号+品牌获取产品"""
-        row = self.conn.execute("SELECT * FROM products WHERE sku = ? AND brand = ?", (sku, brand)).fetchone()
+        row = self.conn.execute(f"SELECT * FROM products WHERE {self._sku_col} = ? AND brand = ?", (sku, brand)).fetchone()
         return dict(row) if row else None
 
     def delete_product(self, product_id: int) -> bool:
@@ -218,7 +234,7 @@ class ProductDB:
         product = self.get_product(product_id)
         if not product:
             return False
-        sku = product["sku"]
+        sku = product.get(self._sku_col) or product.get("sku", "")
         self.conn.execute("DELETE FROM sales_records WHERE sku = ?", (sku,))
         self.conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
         self.conn.commit()
@@ -338,34 +354,36 @@ class ProductDB:
     # 检索（审核时使用）
     # ============================================================
 
-    def get_products_by_category_l2(
-        self, category_l2: str, include_archived: bool = False
+    def get_products_by_category2(
+        self, category2: str, include_archived: bool = False
     ) -> list[dict]:
         """
         按二级品类检索产品，附带最近2月销量和CBB模块。
 
         Returns:
-            [{"id", "sku", "brand", "category_l1", "category_l2", "category_l3",
+            [{"id", "sku", "brand", "category1", "category2", "category3",
               "version", "image_path", "status", "recent_sales": [...],
               "modules": [{cbb_code, cbb_name, category, sub_type, used_position, supplier}]}]
         """
+        sku_col = self._sku_col
         if include_archived:
             rows = self.conn.execute(
-                "SELECT * FROM products WHERE category_l2 = ? ORDER BY category_l3, version, sku",
-                (category_l2,),
+                f"SELECT * FROM products WHERE category2 = ? ORDER BY category3, version, {sku_col}",
+                (category2,),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM products WHERE category_l2 = ? AND status = 'active' ORDER BY category_l3, version, sku",
-                (category_l2,),
+                f"SELECT * FROM products WHERE category2 = ? AND status = 'active' ORDER BY category3, version, {sku_col}",
+                (category2,),
             ).fetchall()
 
         result = []
         for row in rows:
             product = dict(row)
-            product["recent_sales"] = self.get_recent_sales(product["sku"], months=2, brand=product.get("brand", ""))
+            sku_val = product.get(sku_col) or product.get("sku", "")
+            product["recent_sales"] = self.get_recent_sales(sku_val, months=2, brand=product.get("brand", ""))
             # 添加 CBB 模块数据
-            product["modules"] = self._get_product_modules(product["sku"])
+            product["modules"] = self._get_product_modules(sku_val)
             result.append(product)
         return result
 
@@ -382,7 +400,7 @@ class ProductDB:
 
         # 各二级品类分布
         cats = self.conn.execute(
-            "SELECT category_l2, COUNT(*) as cnt FROM products WHERE status = 'active' GROUP BY category_l2 ORDER BY cnt DESC"
+            "SELECT category2, COUNT(*) as cnt FROM products WHERE status = 'active' GROUP BY category2 ORDER BY cnt DESC"
         ).fetchall()
 
         return {
@@ -390,11 +408,11 @@ class ProductDB:
             "active": active,
             "archived": archived,
             "sales_months": sales_months,
-            "categories": [{"name": r["category_l2"], "count": r["cnt"]} for r in cats if r["category_l2"]],
+            "categories": [{"name": r["category2"], "count": r["cnt"]} for r in cats if r["category2"]],
         }
 
     def list_products(
-        self, status: str = None, brand: str = None, category_l2: str = None,
+        self, status: str = None, brand: str = None, category2: str = None,
         offset: int = 0, limit: int = 20,
     ) -> list[dict]:
         """分页查询产品列表"""
@@ -406,9 +424,9 @@ class ProductDB:
         if brand:
             conditions.append("brand = ?")
             params.append(brand)
-        if category_l2:
-            conditions.append("category_l2 = ?")
-            params.append(category_l2)
+        if category2:
+            conditions.append("category2 = ?")
+            params.append(category2)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         sql = f"SELECT * FROM products {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?"

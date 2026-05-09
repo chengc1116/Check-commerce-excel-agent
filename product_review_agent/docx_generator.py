@@ -148,6 +148,8 @@ def generate_review_docx(
 
     # 竞品对比信息
     comparison = project_data.get("product_comparison")
+    if not comparison and project_data.get("competitor_price"):
+        comparison = {"competitor_price": project_data["competitor_price"]}
     if comparison:
         doc.add_paragraph("")  # 空行
         p = doc.add_paragraph()
@@ -181,18 +183,18 @@ def generate_review_docx(
     doc.add_heading("三、人群与场景分析", level=1)
 
     as_score = common_scores.get("audience_scenario", {})
-    if as_score and as_score.get("total_score"):
+    if as_score:
         _add_audience_scenario_section(doc, as_score)
     else:
         # 兼容旧格式（单独的 audience + scenario）
         audience = common_scores.get("audience", {})
         scenario = common_scores.get("scenario", {})
-        if audience and audience.get("total_score"):
-            _add_score_section(doc, audience, "人群")
-        if scenario and scenario.get("total_score"):
-            _add_score_section(doc, scenario, "场景")
+        if audience:
+            _add_analysis_only_section(doc, audience, "人群")
+        if scenario:
+            _add_analysis_only_section(doc, scenario, "场景")
         if not audience and not scenario:
-            doc.add_paragraph("(暂无人群与场景评分数据)")
+            doc.add_paragraph("(暂无人群与场景分析数据)")
 
     # ================================================================
     # 四、专项分析
@@ -202,10 +204,55 @@ def generate_review_docx(
     if specific_score:
         _add_score_section(doc, specific_score, "专项")
 
+        # 爆品升级5维度详细评语（每个维度单独段落展示）
+        if task_label and "爆品" in task_label:
+            _add_hot_upgrade_dimension_details(doc, specific_score)
+
+    # 升级信息详情
+    proj = specific_analysis.get("project_data", {}) if specific_analysis else {}
+    if proj:
+        detail_items = []
+        if proj.get("upgrade_modules"):
+            detail_items.append(("升级模块", proj["upgrade_modules"]))
+        if proj.get("design_purpose"):
+            detail_items.append(("升级目的", proj["design_purpose"]))
+        if proj.get("product_hotpoint"):
+            detail_items.append(("原有卖点", proj["product_hotpoint"]))
+        if proj.get("upgrade_valiable"):
+            detail_items.append(("可行性说明", proj["upgrade_valiable"]))
+        if proj.get("pricing"):
+            detail_items.append(("定价", proj["pricing"]))
+        if proj.get("erp_cost"):
+            detail_items.append(("ERP成本", proj["erp_cost"]))
+        if detail_items:
+            _add_kv_table(doc, detail_items)
+
     # VL对比拆解详细内容
     vl_report = specific_analysis.get("vl_report", {}) if specific_analysis else {}
     if vl_report and "error" not in vl_report:
         _add_vl_report_sections(doc, vl_report)
+
+    # 模块销量验证
+    module_sales_v = specific_analysis.get("module_sales_verification", {}) if specific_analysis else {}
+    if module_sales_v and module_sales_v.get("available"):
+        doc.add_paragraph("")
+        p = doc.add_paragraph()
+        run = p.add_run("模块销量验证")
+        run.bold = True
+        run.font.size = Pt(11)
+        summary = module_sales_v.get("summary", "")
+        if summary:
+            doc.add_paragraph(summary)
+        for v in module_sales_v.get("verifications", []):
+            matched = v.get("matched_cbb_code")
+            if matched:
+                rank_str = f"#{v['rank']}" if v.get("rank") else "无排名"
+                sales_str = f"销量{v['module_sales']}" if v.get("module_sales") else ""
+                trend_str = f"趋势{v['trend']}" if v.get("trend") and v["trend"] != "unknown" else ""
+                upgrade_str = "↑优于原模块" if v.get("is_upgrade") else ("↓低于原模块" if v.get("is_upgrade") is False else "")
+                doc.add_paragraph(f"{v['module_name']} → {v['matched_cbb_name']} | 排名{rank_str} {sales_str} {trend_str} {upgrade_str}", style="List Bullet")
+            else:
+                doc.add_paragraph(f"{v['module_name']} → 未匹配到销量数据", style="List Bullet")
 
     # 逐模块差距矩阵（Word 表格）
     module_comparison = _extract_module_comparison(specific_analysis)
@@ -259,12 +306,11 @@ def generate_review_docx(
     else:
         run.font.color.rgb = COLOR_GREEN
 
-    # 权重明细
-    p = doc.add_paragraph()
-    as_total = as_score.get("total_score", 0) if as_score else 0
+    # 专项评分
     sp_total = _get_specific_total(specific_score)
-    p.add_run("评分权重: ").bold = True
-    p.add_run(f"人群与场景 × 0.4 ({as_total}分) + 专项分析 × 0.6 ({sp_total}分)")
+    p = doc.add_paragraph()
+    p.add_run("专项评分: ").bold = True
+    p.add_run(f"{sp_total}/100（人群与场景仅做分析参考，不纳入评分）")
 
     # 各部分优劣势汇总
     all_strengths = []
@@ -294,6 +340,10 @@ def generate_review_docx(
     design_req = project_data.get("design_requirements", "")
     if not design_req:
         design_req = project_data.get("design_requirement", "")
+    if not design_req:
+        design_req = project_data.get("design_require", "")
+    if not design_req and project_data.get("design_purpose"):
+        design_req = project_data["design_purpose"]
     if not design_req:
         # 从 report_text 中提取
         design_req = _extract_design_requirements(report_text)
@@ -381,7 +431,72 @@ def _add_score_section(doc, score_data: dict, section_name: str):
                 t.rows[i + 1].cells[0].text = name
                 max_s = info.get("max_score", 25)
                 t.rows[i + 1].cells[1].text = f"{info.get('score', 0)}/{max_s}"
-                t.rows[i + 1].cells[2].text = info.get("reason", "")
+                # 多行reason拆分到单元格
+                reason = info.get("reason", "")
+                cell = t.rows[i + 1].cells[2]
+                # 清除默认段落
+                for p in cell.paragraphs:
+                    p.clear()
+                sub_lines = [r.strip() for r in reason.split("\n") if r.strip()]
+                if sub_lines:
+                    first = True
+                    for sl in sub_lines:
+                        if first:
+                            cell.paragraphs[0].add_run(sl)
+                            first = False
+                        else:
+                            new_p = cell.add_paragraph()
+                            new_p.add_run(sl)
+                for cell_item in t.rows[i + 1].cells:
+                    for paragraph in cell_item.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.size = Pt(9)
+                            run.font.name = "微软雅黑"
+                            run.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # 优势/不足/建议
+    for label, key, color in [
+        ("优势", "strengths", COLOR_GREEN),
+        ("不足", "weaknesses", COLOR_RED),
+        ("改进建议", "suggestions", COLOR_BLUE),
+    ]:
+        items = score_data.get(key, [])
+        if items:
+            _add_bullet_list(doc, label, items, color)
+
+
+def _add_analysis_only_section(doc, score_data: dict, section_name: str):
+    """添加仅分析内容的板块（不显示分数）"""
+    analysis = score_data.get("analysis", {})
+    if analysis:
+        for key, text in analysis.items():
+            if text and isinstance(text, str):
+                p = doc.add_paragraph()
+                run = p.add_run(f"【{key}】")
+                run.bold = True
+                doc.add_paragraph(text)
+
+    # 维度分析表
+    dimensions = score_data.get("dimensions", {})
+    if dimensions:
+        if isinstance(dimensions, dict):
+            dim_items = [(name, info) for name, info in dimensions.items()
+                         if isinstance(info, dict)]
+        elif isinstance(dimensions, list):
+            dim_items = [(d.get("name", ""), d) for d in dimensions
+                         if isinstance(d, dict)]
+        else:
+            dim_items = []
+        if dim_items:
+            t = doc.add_table(rows=len(dim_items) + 1, cols=2, style="Light Grid Accent 1")
+            for j, header in enumerate(["维度", "分析结论"]):
+                t.rows[0].cells[j].text = header
+                for run in t.rows[0].cells[j].paragraphs[0].runs:
+                    run.bold = True
+                    run.font.size = Pt(9)
+            for i, (name, info) in enumerate(dim_items):
+                t.rows[i + 1].cells[0].text = name
+                t.rows[i + 1].cells[1].text = info.get("reason", "")
                 for cell in t.rows[i + 1].cells:
                     for paragraph in cell.paragraphs:
                         for run in paragraph.runs:
@@ -401,13 +516,7 @@ def _add_score_section(doc, score_data: dict, section_name: str):
 
 
 def _add_audience_scenario_section(doc, as_score: dict):
-    """添加合并版人群与场景分析板块"""
-    total = as_score.get("total_score", 0)
-    p = doc.add_paragraph()
-    run = p.add_run(f"综合评分: {total}/100")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = _score_color(total)
+    """添加合并版人群与场景分析板块（仅分析，不评分）"""
 
     # 分析段落
     analysis = as_score.get("analysis", {})
@@ -446,22 +555,21 @@ def _add_audience_scenario_section(doc, as_score: dict):
         if expert_items:
             _add_kv_table(doc, expert_items)
 
-    # 评分明细表
+    # 维度分析表（不显示分数）
     scores = as_score.get("scores", {})
     if scores:
         score_items = [(name, info) for name, info in scores.items()
                        if isinstance(info, dict)]
         if score_items:
-            t = doc.add_table(rows=len(score_items) + 1, cols=3, style="Light Grid Accent 1")
-            for j, header in enumerate(["维度", "得分", "结论"]):
+            t = doc.add_table(rows=len(score_items) + 1, cols=2, style="Light Grid Accent 1")
+            for j, header in enumerate(["维度", "分析结论"]):
                 t.rows[0].cells[j].text = header
                 for run in t.rows[0].cells[j].paragraphs[0].runs:
                     run.bold = True
                     run.font.size = Pt(9)
             for i, (name, info) in enumerate(score_items):
                 t.rows[i + 1].cells[0].text = name
-                t.rows[i + 1].cells[1].text = f"{info.get('score', 0)}/25"
-                t.rows[i + 1].cells[2].text = info.get("reason", "")
+                t.rows[i + 1].cells[1].text = info.get("reason", "")
                 for cell in t.rows[i + 1].cells:
                     for paragraph in cell.paragraphs:
                         for run in paragraph.runs:
@@ -1004,6 +1112,53 @@ def _extract_design_requirements(report_text: str) -> str:
                 captured.append(stripped)
 
     return "\n".join(captured)
+
+
+def _add_hot_upgrade_dimension_details(doc, specific_score: dict):
+    """为爆品升级添加5维度详细评语段落"""
+    dimensions = specific_score.get("dimensions", [])
+    if not dimensions:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 各维度详细评语 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    dim_labels = {
+        "模块复用": "模块复用（48分）: 核心/非核心模块复用 + 升级方向匹配 + 市场验证",
+        "模块升级合理性": "模块升级合理性（22分）: 目标-动作一致性 + 卖点保留度 + 升级必要性",
+        "价格分析": "价格分析（10分）: 价格定位合理性 + 成本-定价匹配度",
+        "营销分析": "营销分析（10分）: 升级卖点的营销价值",
+        "可行性分析": "可行性分析（10分）: 供应链/打样可行性",
+    }
+
+    for dim in dimensions:
+        if not isinstance(dim, dict):
+            continue
+        name = dim.get("name", "")
+        score = dim.get("score", 0)
+        max_s = dim.get("max_score", 10)
+        reason = dim.get("reason", "")
+
+        label = dim_labels.get(name, f"{name}（{max_s}分）")
+        p = doc.add_paragraph()
+        run = p.add_run(f"【{label}】")
+        run.bold = True
+        run.font.size = Pt(10.5)
+
+        score_color = COLOR_GREEN if score >= max_s * 0.7 else (RGBColor(0xFF, 0x99, 0x00) if score >= max_s * 0.4 else COLOR_RED)
+        p2 = doc.add_paragraph()
+        run2 = p2.add_run(f"得分: {score}/{max_s}")
+        run2.bold = True
+        run2.font.color.rgb = score_color
+
+        if reason:
+            for line in reason.split("\n"):
+                line = line.strip()
+                if line:
+                    doc.add_paragraph(line)
 
 
 def _get_specific_total(specific_score: dict) -> int:

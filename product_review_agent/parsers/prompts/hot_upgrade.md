@@ -27,20 +27,23 @@
 - scene_analysis: 场景分析的完整原文（包括场景描述、场景排序等，原样保存）
 - group_extra: 群体分析区域中除人群和场景外的其它内容（如核心人群分析、痛点总结等），找不到则设为null
 
-【三、自有产品升级方向】
-- product_code: 自家产品货号（与基础信息中的product_code一致，若该区域有更具体的货号信息则以这里为准）
-- upgrade_direction: 具体升级方向（完整原文，如"支撑性升级+外观调整+适用人群扩大"）
+【三、自有爆品信息】
+- product_code: 爆品产品货号（与基础信息中的product_code一致，若该区域有更具体的货号信息则以这里为准）
+- product_price: 爆品产品价格
+- product_hotpoint: 爆品卖点（完整原文，如"柔软舒适"）
 
 【四、产品设计要求】
-- design_purpose: 设计目的概述（ABC三大分类选择：A类=品牌爆款/核心利润款，B类=流量款/跑量款，C类=长尾款/补充款。提取字母即可，如"A"或"A类"）
-- outlook: 改外观/品牌的具体描述
-- material: 升级材料的具体描述
-- function: 升级功能的具体描述
+- design_purpose: 设计目的（完整原文，分条描述）
 - upgrade_modules: 具体升级模块（完整描述，如"1.支撑模块升级成记忆棉 2.外观模块调整"）
+- upgrade_valiable: 升级可行性分析（可能为空，这一部分描述是增强模块那里的可行性）
+
+【五、竞品信息】
+- competitor_price: 竞品价格（保留原格式，可包含多个价格，如"139/只、129/只"）
+- competitor_url: 竞品链接（可能为空）
 
 == 注意事项 ==
 1. 找不到的字段设为null，数组字段找不到则设为空数组[]
-2. product_code是自家产品货号，务必提取，通常出现在"升级方向"区域
+2. product_code是自家产品货号，务必提取，通常出现在"爆品产品货号"区域
 3. people_analysis和scene_analysis保留原文，不要拆分或重组
-4. design_purpose只需提取ABC分类字母，不需要描述
+4. design_purpose保留完整原文，包括分条描述
 5. 返回纯JSON，不要加```json```包裹

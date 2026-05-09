@@ -222,47 +222,47 @@ def build_review_card(
 
     dimension_elements.append({"tag": "hr"})
 
-    # 人群评分
-    if audience_score > 0:
-        audience_dims = scores.get("audience", {}).get("dimensions", {})
+    # 人群分析（仅展示分析内容，不评分）
+    audience_analysis = scores.get("audience", {})
+    if audience_analysis:
+        audience_dims = audience_analysis.get("dimensions", {})
         dim_lines = []
         for dim_name, dim_info in audience_dims.items():
-            s = dim_info.get("score", 0) if isinstance(dim_info, dict) else 0
-            dim_lines.append(f"  {dim_name}: {s}/25")
+            reason = dim_info.get("reason", "") if isinstance(dim_info, dict) else ""
+            if reason:
+                dim_lines.append(f"  {dim_name}: {reason[:60]}")
 
-        dimension_elements.append({
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": (
-                    f"**人群分析** {audience_score}/100 {_score_emoji(audience_score)}\n"
-                    + "\n".join(dim_lines)
-                ),
-            },
-        })
+        if dim_lines:
+            dimension_elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "**人群分析**\n" + "\n".join(dim_lines),
+                },
+            })
 
-        _append_strength_weakness(dimension_elements, scores.get("audience", {}))
+        _append_strength_weakness(dimension_elements, audience_analysis)
 
-    # 场景评分
-    if scenario_score > 0:
-        scenario_dims = scores.get("scenario", {}).get("dimensions", {})
+    # 场景分析（仅展示分析内容，不评分）
+    scenario_analysis = scores.get("scenario", {})
+    if scenario_analysis:
+        scenario_dims = scenario_analysis.get("dimensions", {})
         dim_lines = []
         for dim_name, dim_info in scenario_dims.items():
-            s = dim_info.get("score", 0) if isinstance(dim_info, dict) else 0
-            dim_lines.append(f"  {dim_name}: {s}/25")
+            reason = dim_info.get("reason", "") if isinstance(dim_info, dict) else ""
+            if reason:
+                dim_lines.append(f"  {dim_name}: {reason[:60]}")
 
-        dimension_elements.append({
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": (
-                    f"**场景分析** {scenario_score}/100 {_score_emoji(scenario_score)}\n"
-                    + "\n".join(dim_lines)
-                ),
-            },
-        })
+        if dim_lines:
+            dimension_elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "**场景分析**\n" + "\n".join(dim_lines),
+                },
+            })
 
-        _append_strength_weakness(dimension_elements, scores.get("scenario", {}))
+        _append_strength_weakness(dimension_elements, scenario_analysis)
 
     # 🆕 专项分析评分
     if specific_score:
@@ -343,9 +343,21 @@ def _append_specific_score_card(elements: list, specific_score):
             score = d.get("score", 0)
             max_s = d.get("max_score", 25)
             reason = d.get("reason", "")
-            dim_lines.append(f"  {name}: {score}/{max_s} - {reason}")
         elif hasattr(d, "name"):
-            dim_lines.append(f"  {d.name}: {d.score}/{d.max_score} - {d.reason}")
+            name = d.name
+            score = d.score
+            max_s = d.max_score
+            reason = d.reason
+        else:
+            continue
+        # 多行reason拆分显示
+        sub_lines = [r.strip() for r in reason.split("\n") if r.strip()]
+        if sub_lines:
+            dim_lines.append(f"  {name}: {score}/{max_s}")
+            for sl in sub_lines:
+                dim_lines.append(f"    {sl}")
+        else:
+            dim_lines.append(f"  {name}: {score}/{max_s}")
 
     content = f"**{label}专项分析** {total}/100 {_score_emoji(total)}\n"
     if dim_lines:

@@ -363,7 +363,7 @@ async def analyze_with_history(project_data: dict) -> dict:
         if not category_l2:
             return {"products": [], "analysis": None}
 
-        products = db.get_products_by_category_l2(category_l2)
+        products = db.get_products_by_category2(category_l2)
         if not products:
             return {"products": [], "analysis": None}
 
