@@ -232,27 +232,33 @@ def generate_review_docx(
     if vl_report and "error" not in vl_report:
         _add_vl_report_sections(doc, vl_report)
 
-    # 模块销量验证
-    module_sales_v = specific_analysis.get("module_sales_verification", {}) if specific_analysis else {}
-    if module_sales_v and module_sales_v.get("available"):
-        doc.add_paragraph("")
-        p = doc.add_paragraph()
-        run = p.add_run("模块销量验证")
-        run.bold = True
-        run.font.size = Pt(11)
-        summary = module_sales_v.get("summary", "")
-        if summary:
-            doc.add_paragraph(summary)
-        for v in module_sales_v.get("verifications", []):
-            matched = v.get("matched_cbb_code")
-            if matched:
-                rank_str = f"#{v['rank']}" if v.get("rank") else "无排名"
-                sales_str = f"销量{v['module_sales']}" if v.get("module_sales") else ""
-                trend_str = f"趋势{v['trend']}" if v.get("trend") and v["trend"] != "unknown" else ""
-                upgrade_str = "↑优于原模块" if v.get("is_upgrade") else ("↓低于原模块" if v.get("is_upgrade") is False else "")
-                doc.add_paragraph(f"{v['module_name']} → {v['matched_cbb_name']} | 排名{rank_str} {sales_str} {trend_str} {upgrade_str}", style="List Bullet")
-            else:
-                doc.add_paragraph(f"{v['module_name']} → 未匹配到销量数据", style="List Bullet")
+    # 模块CBB分类映射
+    llm_scoring = specific_analysis.get("llm_scoring", {}) if specific_analysis else {}
+    mr = llm_scoring.get("module_reuse", {})
+    if mr and not mr.get("_error"):
+        mapping = mr.get("vl_to_cbb_mapping", [])
+        if mapping:
+            doc.add_paragraph("")
+            p = doc.add_paragraph()
+            run = p.add_run("VL模块→CBB分类映射")
+            run.bold = True
+            run.font.size = Pt(11)
+            for m in mapping[:10]:
+                doc.add_paragraph(
+                    f"{m.get('vl_module', '?')} → {m.get('cbb_category', '?')} ({m.get('side', '')})",
+                    style="List Bullet"
+                )
+        core_cats = mr.get("core_categories", [])
+        if core_cats:
+            doc.add_paragraph(f"核心CBB分类: {', '.join(core_cats)}")
+        missing_cats = mr.get("missing_categories", [])
+        if missing_cats:
+            p = doc.add_paragraph()
+            run = p.add_run(f"缺失分类: {', '.join(missing_cats)}")
+            run.font.color.rgb = COLOR_RED
+        reuse_cats = mr.get("reuse_categories", [])
+        if reuse_cats:
+            doc.add_paragraph(f"可复用分类: {', '.join(reuse_cats)}")
 
     # 逐模块差距矩阵（Word 表格）
     module_comparison = _extract_module_comparison(specific_analysis)
