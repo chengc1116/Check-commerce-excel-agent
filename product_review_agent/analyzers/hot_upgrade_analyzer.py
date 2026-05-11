@@ -467,67 +467,102 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
         own_only = comparison.get("own_only", [])
 
         # ==================== 维度1: 模块复用 (48分) ====================
-        # 1a: 核心模块复用 (20分) — 面料、版型
-        core_reuse_score = 10  # 基础分
+        # 自适应模块分类：根据模块名+描述自动判断核心/非核心，不硬编码关键词
+
+        # 合并所有模块名+描述，用于分类
+        all_module_names = []
+        all_module_descs = {}
+        for m in same_modules:
+            name = m.get("module_name", "")
+            all_module_names.append(name)
+            all_module_descs[name] = f"{name} {m.get('own_detail', '')} {m.get('competitor_detail', '')}"
+        for m in competitor_only:
+            name = m.get("module_name", "")
+            if name not in all_module_descs:
+                all_module_names.append(name)
+                all_module_descs[name] = f"{name} {m.get('detail', '')}"
+        for m in own_only:
+            name = m.get("module_name", "")
+            if name not in all_module_descs:
+                all_module_names.append(name)
+                all_module_descs[name] = f"{name} {m.get('detail', '')}"
+
+        # 核心模块判断：有实质结构性/材料性描述的模块为核心模块
+        # 高权重关键词（结构性/材料性模块）
+        HIGH_WEIGHT_KW = [
+            "面料", "材质", "材料", "棉", "丝", "竹纤维", "记忆棉", "乳胶", "冰丝",
+            "版型", "结构", "骨架", "弹簧", "填充", "芯体", "内芯",
+            "工艺", "缝制", "绗缝", "针织", "梭织", "编织",
+        ]
+        # 低权重关键词（装饰性/辅助性模块）
+        LOW_WEIGHT_KW = [
+            "logo", "标志", "商标", "吊牌", "包装", "标牌", "水洗标",
+            "装饰", "花型", "印花", "绣花", "图案", "花色",
+            "颜色", "配色", "色系",
+        ]
+
+        core_modules = []
+        non_core_modules = []
+        for name in all_module_names:
+            desc = all_module_descs.get(name, "")
+            if any(kw in desc for kw in HIGH_WEIGHT_KW):
+                core_modules.append(name)
+            elif any(kw in desc for kw in LOW_WEIGHT_KW):
+                non_core_modules.append(name)
+            else:
+                # 无法判断的默认归为核心（偏保守）
+                core_modules.append(name)
+
+        # 1a: 核心模块复用 (20分)
+        core_reuse_score = 10
         core_reuse_reason = ""
 
-        core_modules = ["面料", "版型"]
-        core_hit = 0
-        core_details = []
-        for mod in same_modules:
-            mod_name = mod.get("module_name", "")
-            for core in core_modules:
-                if core in mod_name:
-                    core_hit += 1
-                    core_details.append(mod_name)
-                    break
+        same_names = {m.get("module_name", "") for m in same_modules}
+        core_hit = [n for n in core_modules if n in same_names]
+        core_miss = [n for n in core_modules if n not in same_names]
 
-        if core_hit >= 2:
-            core_reuse_score = 20
-            core_reuse_reason = f"核心模块均复用: {', '.join(core_details)}"
-        elif core_hit == 1:
-            core_reuse_score = 12
-            core_reuse_reason = f"部分核心模块复用: {', '.join(core_details)}"
-        else:
-            # 检查竞品独有中是否有核心模块
-            comp_core = []
-            for mod in competitor_only:
-                mod_name = mod.get("module_name", "")
-                for core in core_modules:
-                    if core in mod_name:
-                        comp_core.append(mod_name)
-                        break
-            if comp_core:
-                core_reuse_score = 5
-                core_reuse_reason = f"核心模块未复用，竞品独有: {', '.join(comp_core)}"
+        if core_modules:
+            core_rate = len(core_hit) / len(core_modules)
+            if core_rate >= 0.8:
+                core_reuse_score = 20
+            elif core_rate >= 0.5:
+                core_reuse_score = 14
+            elif core_rate >= 0.2:
+                core_reuse_score = 8
             else:
-                core_reuse_score = 10
-                core_reuse_reason = "核心模块信息不足，按基础分评估"
+                core_reuse_score = 3
+            core_reuse_reason = f"核心模块复用率{int(core_rate*100)}%({len(core_hit)}/{len(core_modules)})"
+            if core_hit:
+                core_reuse_reason += f"，已复用: {', '.join(core_hit[:3])}"
+            if core_miss:
+                core_reuse_reason += f"，未复用: {', '.join(core_miss[:3])}"
+        else:
+            core_reuse_reason = "无法识别核心模块，按基础分评估"
 
         # 1b: 非核心模块复用 (6分)
-        non_core_reuse_score = 3  # 基础分
+        non_core_reuse_score = 3
         non_core_reuse_reason = ""
 
-        total_modules = len(same_modules) + len(competitor_only) + len(own_only)
-        if total_modules > 0:
-            non_core_same = len(same_modules) - core_hit
-            non_core_total = total_modules - len(core_modules)
-            if non_core_total > 0:
-                non_core_rate = non_core_same / non_core_total
-                if non_core_rate >= 0.7:
-                    non_core_reuse_score = 6
-                elif non_core_rate >= 0.4:
-                    non_core_reuse_score = 4
-                else:
-                    non_core_reuse_score = 2
-                non_core_reuse_reason = f"非核心模块复用率{int(non_core_rate * 100)}%({non_core_same}/{non_core_total})"
+        all_modules_count = len(all_module_names)
+        non_core_hit = [n for n in non_core_modules if n in same_names]
+        if non_core_modules:
+            nc_rate = len(non_core_hit) / len(non_core_modules)
+            if nc_rate >= 0.7:
+                non_core_reuse_score = 6
+            elif nc_rate >= 0.4:
+                non_core_reuse_score = 4
             else:
-                non_core_reuse_reason = "非核心模块信息不足"
+                non_core_reuse_score = 2
+            non_core_reuse_reason = f"非核心模块复用率{int(nc_rate*100)}%({len(non_core_hit)}/{len(non_core_modules)})"
+        elif all_modules_count > 0:
+            # 所有模块都被归类为核心，非核心项给满分
+            non_core_reuse_score = 6
+            non_core_reuse_reason = "所有模块均为核心模块"
         else:
             non_core_reuse_reason = "无模块对比数据"
 
         # 1c: 升级方向匹配度 (12分) — VL分析 + 数据库检索
-        direction_match_score = 6  # 基础分
+        direction_match_score = 6
         direction_match_reason = ""
 
         upgrade_modules_text = project_data.get("upgrade_modules", "")
@@ -557,7 +592,7 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
             direction_match_reason = "未填写升级模块信息"
 
         # 1d: 目标模块市场验证 (10分)
-        market_verify_score = 5  # 基础分
+        market_verify_score = 5
         market_verify_reason = ""
 
         if module_sales_v.get("available") and module_sales_v.get("best_verification"):
@@ -713,7 +748,7 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
         # 自动生成建议
         suggestions = []
         if core_reuse_score < 12:
-            suggestions.append("核心模块（面料/版型）复用不足，需评估新建成本")
+            suggestions.append("核心模块复用不足，需评估新建成本")
         if direction_match_score < 6:
             suggestions.append("升级方向在CBB模块库中匹配度低，可能需要新开模块")
         if upgrade_rationality_score < 14:
