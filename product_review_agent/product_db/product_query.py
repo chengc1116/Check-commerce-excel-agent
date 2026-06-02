@@ -569,12 +569,10 @@ class ProductQuery:
         cat2_col = self._col("category2")
         cat3_col = self._col("category3")
 
-        conditions = [f"{cat2_col} = ?"]
-        params: list = [category_l2]
-        if category_l3:
-            conditions.append(f"{cat3_col} = ?")
-            params.append(category_l3)
-        where = f"WHERE {' AND '.join(conditions)}"
+        # 带降级的品类匹配：精确 → 仅l2 → 模糊LIKE
+        conditions, params, where = self._build_category_where(
+            cat2_col, cat3_col, category_l2, category_l3
+        )
 
         # 产品总数
         total_products = self.conn.execute(
@@ -650,6 +648,68 @@ class ProductQuery:
             "top_selling_products": top_selling,
             "total_category_sales": total_category_sales,
         }
+
+    def _build_category_where(
+        self, cat2_col: str, cat3_col: str,
+        category_l2: str, category_l3: str = "",
+    ) -> tuple:
+        """
+        带降级的品类WHERE条件构建。
+
+        降级策略：
+        1. 精确匹配 category_l2 + category_l3
+        2. 仅精确匹配 category_l2（忽略 l3）
+        3. 模糊匹配 category_l2（LIKE '%xxx%'）
+        4. 按 l2 关键词拆分匹配（LIKE '%keyword%'）
+        """
+        # 尝试1: 精确匹配 l2 + l3
+        if category_l3:
+            cond = [f"{cat2_col} = ?", f"{cat3_col} = ?"]
+            p = [category_l2, category_l3]
+            cnt = self.conn.execute(
+                f"SELECT COUNT(*) FROM products WHERE {' AND '.join(cond)}", p
+            ).fetchone()[0]
+            if cnt > 0:
+                return cond, p, f"WHERE {' AND '.join(cond)}"
+
+        # 尝试2: 仅精确匹配 l2
+        cond = [f"{cat2_col} = ?"]
+        p = [category_l2]
+        cnt = self.conn.execute(
+            f"SELECT COUNT(*) FROM products WHERE {' AND '.join(cond)}", p
+        ).fetchone()[0]
+        if cnt > 0:
+            logger.info(f"[ProductQuery] category_l2='{category_l2}' 精确匹配 {cnt} 条")
+            return cond, p, f"WHERE {' AND '.join(cond)}"
+
+        # 尝试3: 模糊匹配 l2
+        cond = [f"{cat2_col} LIKE ?"]
+        p = [f"%{category_l2}%"]
+        cnt = self.conn.execute(
+            f"SELECT COUNT(*) FROM products WHERE {' AND '.join(cond)}", p
+        ).fetchone()[0]
+        if cnt > 0:
+            logger.info(f"[ProductQuery] category_l2 LIKE '%{category_l2}%' 模糊匹配 {cnt} 条")
+            return cond, p, f"WHERE {' AND '.join(cond)}"
+
+        # 尝试4: 按关键词拆分匹配（如"扭伤护踝" → "扭伤" AND "护踝"）
+        import re
+        keywords = [w for w in re.split(r"[\s,，、+/]+", category_l2) if len(w) >= 2]
+        if len(keywords) >= 2:
+            cond = [f"{cat2_col} LIKE ?" for _ in keywords]
+            p = [f"%{kw}%" for kw in keywords]
+            cnt = self.conn.execute(
+                f"SELECT COUNT(*) FROM products WHERE {' AND '.join(cond)}", p
+            ).fetchone()[0]
+            if cnt > 0:
+                logger.info(f"[ProductQuery] category_l2 关键词匹配 {keywords} → {cnt} 条")
+                return cond, p, f"WHERE {' AND '.join(cond)}"
+
+        # 全部未命中，返回原始精确条件（结果为0）
+        logger.warning(f"[ProductQuery] 品类匹配全部未命中: l2='{category_l2}' l3='{category_l3}'")
+        cond = [f"{cat2_col} = ?"]
+        p = [category_l2]
+        return cond, p, f"WHERE {' AND '.join(cond)}"
 
     # ============================================================
     # 批量销量查询

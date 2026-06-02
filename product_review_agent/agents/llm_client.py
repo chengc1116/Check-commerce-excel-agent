@@ -272,9 +272,39 @@ class LLMClient:
         if response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
-        logger.debug(f"LLM 异步请求: model={model}, msgs={len(messages)}")
+        # 计算请求大小
+        total_img_size = 0
+        for msg in messages:
+            if isinstance(msg.get("content"), list):
+                for part in msg["content"]:
+                    if part.get("type") == "image_url":
+                        url = part.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            total_img_size += len(url)
+        logger.info(f"[LLM] 异步请求: model={model}, msgs={len(messages)}, 图片数据大小≈{total_img_size//1024}KB")
+
         response = await client.chat.completions.create(**kwargs)
-        content = response.choices[0].message.content or ""
+
+        choice = response.choices[0] if response.choices else None
+        if not choice:
+            logger.warning(f"[LLM] 响应无choices, response: {response}")
+            return ""
+
+        msg = choice.message
+        content = msg.content or ""
+
+        if not content:
+            # 某些VL模型可能把内容放在其他字段
+            logger.warning(f"[LLM] content为空, model={model}, finish_reason={choice.finish_reason}, "
+                          f"message.role={msg.role}, message keys={list(vars(msg).keys())}")
+            # 尝试从 refusal 或 tool_calls 等字段获取
+            if hasattr(msg, 'refusal') and msg.refusal:
+                logger.warning(f"[LLM] refusal: {msg.refusal[:200]}")
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                logger.warning(f"[LLM] tool_calls: {msg.tool_calls}")
+            # 打印完整的choice对象用于调试
+            logger.warning(f"[LLM] 完整choice: {choice}")
+
         logger.debug(f"LLM 响应: {content[:200]}...")
         return self._parse_response(content, response_format)
 

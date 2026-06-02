@@ -27,7 +27,7 @@ from typing import Optional
 
 from product_review_agent.agents.llm_client import LLMClient, get_llm_client
 from product_review_agent.product_db.product_query import ProductQuery
-from product_review_agent.product_db.cbb_matcher import CBBMatcher, MatchResult
+from product_review_agent.product_db.cbb_matcher import CBBMatcher, MatchResult, extract_target_modules
 from product_review_agent.vl_module_splitter import ModuleSplitter, find_product_images
 from product_review_agent.analyzers.base import (
     BaseAnalyzer,
@@ -170,29 +170,31 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
         except Exception as e:
             logger.error(f"[爆品升级] 市场概况查询异常: {e}")
 
-        # Step 5: CBB模块匹配（竞品独有模块 → sub_type级别匹配）
-        llm = get_llm_client()
+        # Step 5: CBB模块匹配（整合VL模块+设计要求 → FAISS语义检索）
         cbb_match = MatchResult()
         self_cbb_modules = []
 
         comparison = vl_report.get("section3_module_comparison", {})
         competitor_only = comparison.get("competitor_only", [])
-        competitor_module_names = [m.get("module_name", "") for m in competitor_only if m.get("module_name")]
+        vl_module_names = [m.get("module_name", "") for m in competitor_only if m.get("module_name")]
+
+        # 整合VL模块与设计要求
+        target_modules = await extract_target_modules(
+            vl_modules=vl_module_names,
+            design_content=upgrade_direction or design_purpose,
+            upgrade_modules=upgrade_modules,
+            feasibility_analysis=upgrade_valiable,
+        )
+        if target_modules != vl_module_names:
+            logger.info(f"[爆品升级] 模块整合: {vl_module_names} → {target_modules}")
 
         try:
             with CBBMatcher() as matcher:
-                # 竞品独有模块 → CBB sub_type匹配
-                if competitor_module_names:
-                    cbb_match = await matcher.match_modules(
-                        competitor_module_names, llm, product_category=category2,
-                    )
+                if target_modules:
+                    cbb_match = matcher.match_modules(target_modules)
                     logger.info(f"[爆品升级] CBB匹配: {cbb_match.matched}/{cbb_match.total} 匹配率{cbb_match.match_rate}%")
-
-                # 获取CBB库摘要（供LLM参考）
-                cbb_summary = matcher.get_cbb_summary()
         except Exception as e:
             logger.error(f"[爆品升级] CBB匹配异常: {e}")
-            cbb_summary = ""
 
         # 获取自家产品CBB模块
         self_cbb_modules = self._get_self_cbb_modules(product_code)
@@ -215,7 +217,7 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
             "is_new_category": project_data.get("is_new_category", "否"),
         }
         llm_scoring = await self._llm_full_scoring(
-            vl_report, full_project_data, cbb_summary, self_cbb_modules, cbb_match
+            vl_report, full_project_data, self_cbb_modules, cbb_match
         )
 
         return {
@@ -246,7 +248,7 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
             return []
 
     async def _llm_full_scoring(self, vl_report: dict, project_data: dict,
-                                 cbb_summary: str, self_cbb_modules: list,
+                                 self_cbb_modules: list,
                                  cbb_match: MatchResult) -> dict:
         """LLM 全维度评分：模块复用 + 升级合理性 + 价格 + 营销 + 可行性"""
         llm = get_llm_client()
@@ -286,18 +288,18 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
         else:
             self_cbb_str = "  (自家产品无CBB模块数据)"
 
-        # 构建 CBB 匹配结果摘要（sub_type级别）
+        # 构建 CBB 匹配结果摘要（FAISS语义检索）
         cbb_match_str = ""
         if cbb_match and cbb_match.module_matches:
             cbb_match_str = f"匹配率: {cbb_match.match_rate}% ({cbb_match.matched}/{cbb_match.total})\n"
             for mm in cbb_match.module_matches:
-                status = "可复用" if mm.matched else "需新建"
+                score_str = f"score={mm.score:.2f}" if mm.score else ""
                 modules_info = ""
                 if mm.cbb_modules:
                     modules_info = " → " + ", ".join(
                         f"{m['cbb_name']}({m['cbb_code']})" for m in mm.cbb_modules[:3]
                     )
-                cbb_match_str += f"  - {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}]{modules_info}\n"
+                cbb_match_str += f"  - {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level} {score_str}]{modules_info}\n"
         else:
             cbb_match_str = "  (无CBB匹配数据)"
 
@@ -315,13 +317,10 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
 ## 任务
 根据以下信息，对爆品升级项目进行5个维度的评分分析。
 
-## CBB模块库分类体系（供参考）
-{cbb_summary[:2000]}
-
 ## 自家产品已关联的CBB模块
 {self_cbb_str}
 
-## 竞品独有模块的CBB匹配结果（sub_type级别）
+## 竞品独有模块的CBB匹配结果（FAISS语义检索）
 {cbb_match_str}
 
 ## VL对比拆解结果（自家 vs 竞品）
@@ -399,7 +398,12 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
 - 升级点能否转化为营销话术/口碑优势
 
 ### 可行性分析（10分）
-- 供应链/打样可行性，模块可获取性（结合CBB匹配结果：已匹配的模块可获取性高）"""
+- 供应链/打样可行性，模块可获取性（结合CBB匹配结果：已匹配的模块可获取性高）
+
+### 重要规则
+- 字段标注"(未填写)"的，表示数据缺失而非该项能力差。请给该项中间分（满分的50%-60%），不要给0分。
+- 只有当字段已填写但内容明显不佳时，才给低分。
+- CBB匹配结果为"无CBB匹配数据"时，表示检索未执行而非模块不可复用，请给该项中间分。"""
 
         try:
             result = await llm.acall_text(
@@ -650,17 +654,18 @@ class HotUpgradeAnalyzer(BaseAnalyzer):
                     lines.append(f"  {sub_line.strip()}")
         lines.append("")
 
-        # CBB匹配详情（sub_type级别）
+        # CBB匹配详情（FAISS语义检索）
         cbb_match = analysis_result.get("cbb_match")
         if cbb_match and hasattr(cbb_match, "module_matches") and cbb_match.module_matches:
-            lines.append("  VL模块→CBB sub_type匹配:")
+            lines.append("  VL模块→CBB匹配 (FAISS语义检索):")
             lines.append(f"  匹配率: {cbb_match.match_rate}% ({cbb_match.matched}/{cbb_match.total})")
             for mm in cbb_match.module_matches[:10]:
                 status = "✓" if mm.matched else "✗"
+                score_str = f" score={mm.score:.2f}" if mm.score else ""
                 modules_info = ""
                 if mm.cbb_modules:
                     modules_info = " → " + ", ".join(m["cbb_name"] for m in mm.cbb_modules[:2])
-                lines.append(f"    [{status}] {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}]{modules_info}")
+                lines.append(f"    [{status}] {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}{score_str}]{modules_info}")
             lines.append("")
 
         # LLM模块映射详情

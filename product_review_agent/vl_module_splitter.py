@@ -160,9 +160,34 @@ def build_single_product_step1_prompt(
 发现图片中有但模块列表中没有的，归入 extra_modules。"""
     else:
         known_section = """
-### 无预设模块定义
-请基于图片自由识别产品类型和功能模块。一般3-9个B级模块。
-命名格式：功能描述+系统类型（如"XXX系统""XXX层""XXX结构""XXX件"）。"""
+### 模块命名规范
+每个B级模块必须是可以独立采购/替换的物料单元。
+命名格式：具体物料名 + 可选的功能/规格描述。
+不要用抽象的功能描述（如"压力分散系统""脊椎支撑系统"），要用具体的物料名称。
+
+必选模块（每个产品必须有）：
+- 版型(PATTERN): 产品的整体构造方式。命名格式为"{产品类型}版型"，
+  如"SBR护膝版型"、"髌骨带版型"、"护腰版型"。
+  注意：版型是产品形态，不是面料，一个产品只有一个版型。
+- 面料(FABRIC): 产品使用的具体面料材质。
+  如"四面弹莱卡布"、"锦纶拉毛布"、"冰感双面莱卡"、"SBR复合布"。
+  一个产品可能有2-3种不同面料（外层、内衬、接触层）。
+
+可选模块（产品中存在才拆，不存在不要硬凑）：
+- 外观(APPEARANCE): LOGO标识和装饰件。
+  如"热转印LOGO标"、"硅胶滴塑标"、"织唛标"、"印花装饰"。
+- 支撑件(PAD): 填充、支撑、缓冲的材料或结构件。
+  如"3D记忆棉"、"铝条支撑片"、"PE塑料条"、"TPE弹性垫"、"硅胶防滑垫"。
+- 魔术贴(VELCRO): 粘扣固定件。如"尼龙勾面魔术贴"、"射出勾面"。
+- 织带(WEBBING): 绑带、松紧带、织带。如"尼龙松紧带"、"弹力织带"。
+- 配件(PARTS): 扣具、拉链、旋钮等五金/塑料配件。
+  如"PP塑料壳"、"塑料插扣"、"BOA旋钮"、"YKK拉链"。
+
+判断标准：如果一个零件不能独立采购或替换，就不要单独拆成模块，
+而是归入它所属的更大模块中。例如"缝线"归入所属面料模块，
+"螺丝"归入所属配件模块。
+
+一般3-7个B级模块（版型+面料必选，其余按实际情况）。"""
 
     return f"""你是产品模块化拆解专家。根据商品图片，输出产品视觉分析和模块拆解。
 
@@ -211,7 +236,10 @@ def build_single_product_step1_prompt(
 }}
 ```
 
-规则：B级3-9个模块，C级每个B下1-3个，priority 1-5(5=不可或缺)，数字字段必须是数字。"""
+规则：
+1. B级模块的name必须是具体的物料名称（如"铝条支撑片"），不要用抽象功能描述（如"脊椎支撑系统"）
+2. 版型和面料是必选模块，其他类别有才拆、没有不要硬凑
+3. C级每个B下1-3个，priority 1-5(5=不可或缺)，数字字段必须是数字"""
 
 
 
@@ -545,9 +573,11 @@ class ModuleSplitter:
         elif isinstance(result, str):
             raw = result
         else:
+            logger.warning("[VL解析] 返回值类型异常: %s", type(result).__name__)
             return None
 
         if not raw:
+            logger.warning("[VL解析] 返回内容为空")
             return None
 
         # 去think标签
@@ -559,17 +589,25 @@ class ModuleSplitter:
         if first_brace != -1 and last_brace > first_brace:
             json_str = raw[first_brace:last_brace + 1]
             try:
-                return json.loads(json_str)
-            except json.JSONDecodeError:
+                parsed = json.loads(json_str)
+                n_b = len(parsed.get("section2_abc_modules", {}).get("b_level", []))
+                logger.info(f"[VL解析] JSON解析成功, b_level模块数: {n_b}")
+                return parsed
+            except json.JSONDecodeError as e:
+                logger.warning(f"[VL解析] JSON解析失败: {e}, 原始文本前200字: {raw[:200]}")
                 fixed = self.llm._try_fix_json(json_str)
                 if fixed:
+                    logger.info("[VL解析] JSON修复成功")
                     return fixed
+                logger.warning("[VL解析] JSON修复也失败")
 
+        logger.warning(f"[VL解析] 未找到有效JSON, 原始文本前200字: {raw[:200]}")
         return None
 
     async def _call_vl_step(self, images: list[bytes], prompt: str,
-                            timeout: int = 200, max_tokens: int = 8000) -> Optional[dict]:
-        """Step1: VL看图分析"""
+                            timeout: int = 200, max_tokens: int = 8000,
+                            max_retries: int = 2) -> Optional[dict]:
+        """Step1: VL看图分析（空响应自动重试）"""
         from product_review_agent.agents.llm_client import LLMClient
 
         user_msg = LLMClient.build_image_message(images, text=prompt)
@@ -579,18 +617,47 @@ class ModuleSplitter:
         }
         messages = [system_msg, user_msg]
 
-        try:
-            result = await asyncio.wait_for(
-                self.llm.acall_vision(messages, response_format="text", max_tokens=max_tokens),
-                timeout=timeout
-            )
-            return self._parse_vl_response(result)
-        except asyncio.TimeoutError:
-            logger.error(f"VL调用超时（{timeout}s）")
-            return None
-        except Exception as e:
-            logger.error(f"VL调用异常: {e}")
-            return None
+        img_sizes = [len(img) for img in images]
+        logger.info(f"[VL调用] 图片数: {len(images)}, 各张大小: {img_sizes} bytes")
+
+        for attempt in range(max_retries):
+            try:
+                result = await asyncio.wait_for(
+                    self.llm.acall_vision(messages, response_format="text", max_tokens=max_tokens),
+                    timeout=timeout
+                )
+
+                # 检查是否返回空内容
+                if result is None or (isinstance(result, str) and not result.strip()):
+                    if attempt < max_retries - 1:
+                        logger.warning(f"[VL调用] 第{attempt+1}次返回空内容, 1秒后重试...")
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"[VL调用] {max_retries}次均返回空内容")
+                        return None
+
+                parsed = self._parse_vl_response(result)
+                if parsed is None:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"[VL调用] 第{attempt+1}次JSON解析失败, 1秒后重试...")
+                        await asyncio.sleep(1)
+                        continue
+                    raw_preview = str(result)[:300] if result else "(None)"
+                    logger.error(f"[VL调用] {max_retries}次均JSON解析失败, 原始响应前300字: {raw_preview}")
+                return parsed
+
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    logger.warning(f"[VL调用] 第{attempt+1}次超时({timeout}s), 重试...")
+                    continue
+                logger.error(f"VL调用超时（{timeout}s）, 已重试{max_retries}次")
+                return None
+            except Exception as e:
+                logger.error(f"VL调用异常: {e}")
+                return None
+
+        return None
 
     async def _call_text_step(self, prompt: str, timeout: int = 120,
                               max_tokens: int = 16000) -> Optional[dict]:

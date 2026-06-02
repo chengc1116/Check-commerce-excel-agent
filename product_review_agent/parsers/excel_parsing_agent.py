@@ -234,7 +234,7 @@ async def call_llm_with_retry(
                     return {"_error": f"timeout_exceeded: {error_msg}"}
 
             else:
-                print(f"  [异常] {error_name}: {error_msg[:200]}")
+                print(f"  [异常]{error_name}: {error_msg[:200]}")
                 return {"_error": f"{error_name}: {error_msg}"}
 
     return {"_error": "max_retries_exceeded"}
@@ -311,8 +311,10 @@ async def parse_excel_to_project_review(file_path: str, task_type: str = "") -> 
     # Step 5: 适配层 — 将新字段映射回下游期望的格式
     if task_type == "category_gap":
         result = _adapt_category_gap(result)
-    elif task_type in ("hot_upgrade", "competitor_upgrade", "low_sale_iterate"):
+    elif task_type in ("hot_upgrade", "competitor_upgrade"):
         result = _adapt_hot_upgrade(result)
+    elif task_type == "low_sale_iterate":
+        result = _adapt_low_sale_iterate(result)
 
     # Step 6: 补充元数据
     elapsed = round(time.time() - start_time, 1)
@@ -366,70 +368,10 @@ def _adapt_hot_upgrade(data: dict) -> dict:
 
 
 def _adapt_category_gap(data: dict) -> dict:
-    """品类缺失适配层：将品类缺失专用字段映射为下游analyzer期望的格式"""
+    """品类缺失适配层：仅提取派生数值，不搬运字段"""
     adapted = dict(data)
 
-    # ── 基础信息 other ──
-    if data.get("base_other"):
-        adapted["base_extra_text"] = data["base_other"]
-
-    # ── 群体分析 → used_people / used_scene / target_audience / target_scenario ──
-    people_analysis = data.get("people_analysis", "")
-    scene_analysis = data.get("scene_analysis", "")
-    group_other = data.get("group_other", "")
-
-    if people_analysis:
-        adapted["used_people"] = [{"raw_text": people_analysis}]
-        adapted["target_audience"] = people_analysis
-    if scene_analysis:
-        adapted["used_scene"] = [{"raw_text": scene_analysis}]
-        adapted["target_scenario"] = scene_analysis
-    if group_other:
-        adapted["group_extra_text"] = group_other
-
-    # ── 竞品产品分析 → product_comparison 对象 ──
-    comparison = {}
-    if data.get("competitor_url"):
-        comparison["comparison_url"] = data["competitor_url"]
-    if data.get("competitor_price"):
-        comparison["competitor_price"] = data["competitor_price"]
-    if data.get("selling_point"):
-        comparison["selling_point"] = data["selling_point"]
-    if data.get("improving_point"):
-        comparison["improving_point"] = data["improving_point"]
-    if data.get("competitor_other"):
-        comparison["competitor_other"] = data["competitor_other"]
-    if comparison:
-        adapted["product_comparison"] = comparison
-
-    # 竞品名称/链接 → competitor_name（analyzer用）
-    if data.get("competitor_url") and not data.get("competitor_name"):
-        adapted["competitor_name"] = data.get("competitor_url")
-
-    # ── 设计要求扁平字段 → design_require 对象 ──
-    design_require = {}
-    if data.get("design_purpose"):
-        design_require["content"] = data["design_purpose"]
-    if data.get("outlook"):
-        design_require["outlook"] = data["outlook"]
-    if data.get("material"):
-        design_require["material"] = data["material"]
-    if data.get("function"):
-        design_require["function"] = data["function"]
-    if data.get("design_other"):
-        design_require["design_other"] = data["design_other"]
-    if design_require:
-        adapted["design_require"] = design_require
-
-    # design_purpose → upgrade_direction（品类缺失没有升级方向，用设计目的替代）
-    if data.get("design_purpose") and not data.get("upgrade_direction"):
-        adapted["upgrade_direction"] = data["design_purpose"]
-
-    # function → upgrade_function
-    if data.get("function") and not data.get("upgrade_function"):
-        adapted["upgrade_function"] = data["function"]
-
-    # ── pricing里提取gfm（毛利率） ──
+    # pricing里提取gfm（毛利率）
     pricing = data.get("pricing", "")
     if pricing and not data.get("gfm"):
         import re
@@ -440,6 +382,38 @@ def _adapt_category_gap(data: dict) -> dict:
     # erp_cost → ERP_price
     if data.get("erp_cost") and not data.get("ERP_price"):
         adapted["ERP_price"] = data["erp_cost"]
+
+    return adapted
+
+
+def _adapt_low_sale_iterate(data: dict) -> dict:
+    """未起量迭代适配层：仅提取派生数值，不搬运字段"""
+    adapted = dict(data)
+
+    # group_extra → group_extra_text（下游字段名不同）
+    if data.get("group_extra"):
+        adapted["group_extra_text"] = data["group_extra"]
+
+    # pricing里提取gfm（毛利率）
+    pricing = data.get("pricing", "")
+    if pricing and not data.get("gfm"):
+        import re
+        m = re.search(r"[/／]\s*(\d+)\s*%?", pricing)
+        if m:
+            adapted["gfm"] = int(m.group(1))
+
+    # erp_cost → ERP_price
+    if data.get("erp_cost") and not data.get("ERP_price"):
+        adapted["ERP_price"] = data["erp_cost"]
+
+    # 竞品信息 → product_comparison 对象（docx_generator读这个字段）
+    if data.get("competitor_price") or data.get("competitor_url"):
+        comparison = adapted.get("product_comparison", {})
+        if data.get("competitor_price"):
+            comparison["competitor_price"] = data["competitor_price"]
+        if data.get("competitor_url"):
+            comparison["comparison_url"] = data["competitor_url"]
+        adapted["product_comparison"] = comparison
 
     return adapted
 

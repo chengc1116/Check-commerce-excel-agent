@@ -23,7 +23,7 @@ from typing import Optional
 
 from product_review_agent.agents.llm_client import LLMClient, get_llm_client
 from product_review_agent.product_db.product_query import ProductQuery
-from product_review_agent.product_db.cbb_matcher import CBBMatcher, MatchResult
+from product_review_agent.product_db.cbb_matcher import CBBMatcher, MatchResult, extract_target_modules
 from product_review_agent.vl_module_splitter import (
     ModuleSplitter,
     find_product_images,
@@ -49,7 +49,7 @@ SCENARIO_A_DIMENSIONS = [
 
 # 场景B评分维度（新品类进入）
 SCENARIO_B_DIMENSIONS = [
-    ("模块可行性", 50, "CBB直接复用 + 模块可获取 + 开模难度"),
+    ("模块可行性", 50, "面料可行性15 + 版型可行性15 + 其它模块可获取性12 + 开模难度8"),
     ("产品设计合理性", 30, "设计目的明确性 + 升级方向合理性 + 差异化价值"),
     ("价格与市场", 20, "价格竞争力 + 市场验证"),
 ]
@@ -73,7 +73,7 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         brand = project_data.get("brand", "")
         competitor_name = project_data.get("competitor_name", "")
         product_name = project_data.get("product_name") or project_data.get("project_name", "")
-        upgrade_direction = project_data.get("upgrade_direction") or project_data.get("product_feature", "")
+        upgrade_direction = project_data.get("upgrade_direction") or project_data.get("design_purpose") or project_data.get("product_feature", "")
         is_new_category = project_data.get("is_new_category", "")
 
         # 判断场景：is_new_category=True → 场景B（品类缺失），否则 → 场景A（品牌缺失）
@@ -215,9 +215,13 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         else:
             logger.warning("[品类缺失] 无可用图片，跳过VL拆解")
 
-        # Step 4: CBB模块匹配
+        if vl_report.get("error"):
+            logger.warning(f"[品类缺失] VL拆解返回错误: {vl_report['error']}")
+        elif not vl_report.get("section2_abc_modules", {}).get("b_level"):
+            logger.warning(f"[品类缺失] VL拆解结果中无b_level模块, vl_report keys: {list(vl_report.keys())}")
+
+        # Step 4: CBB模块匹配（整合VL模块+设计要求 → FAISS语义检索）
         cbb_match = MatchResult()
-        cbb_summary = ""
         self_cbb_modules = []
 
         comparison = vl_report.get("section3_module_comparison", {})
@@ -226,22 +230,43 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 
         if scenario_b:
             # 场景B：匹配所有竞品模块
-            comp_modules = vl_report.get("competitor_modules", [])
-            all_vl_modules = [m.get("name", "") for m in comp_modules if m.get("name")]
+            # 单拆模式：从 section2_abc_modules.b_level 取模块
+            b_level = vl_report.get("section2_abc_modules", {}).get("b_level", [])
+            all_vl_modules = [m.get("name", "") for m in b_level if m.get("name")]
+            # 兼容对比模式
+            if not all_vl_modules:
+                comp_modules = vl_report.get("competitor_modules", [])
+                all_vl_modules = [m.get("name", "") for m in comp_modules if m.get("name")]
             if not all_vl_modules:
                 all_vl_modules = [m.get("module_name", "") for m in competitor_only if m.get("module_name")]
         else:
             # 场景A：只匹配竞品独有模块
             all_vl_modules = [m.get("module_name", "") for m in competitor_only if m.get("module_name")]
 
+        logger.info(f"[品类缺失] VL模块列表({len(all_vl_modules)}个): {all_vl_modules}")
+
+        # 整合VL模块与设计要求
+        design_content = project_data.get("design_content", "") or project_data.get("upgrade_modules", "")
+        feasibility = project_data.get("feasibility_analysis", "") or project_data.get("upgrade_valiable", "")
+        logger.info(f"[品类缺失] 调用extract_target_modules: vl_modules={all_vl_modules}")
+        logger.info(f"[品类缺失] design_content='{(design_content or upgrade_direction)[:100]}'")
+        logger.info(f"[品类缺失] feasibility='{feasibility[:100] if feasibility else ''}'")
+        target_modules = await extract_target_modules(
+            vl_modules=all_vl_modules,
+            design_content=design_content or upgrade_direction,
+            feasibility_analysis=feasibility,
+        )
+        logger.info(f"[品类缺失] extract_target_modules返回: {target_modules}")
+        if target_modules != all_vl_modules:
+            logger.info(f"[品类缺失] 模块已整合: {all_vl_modules} → {target_modules}")
+        else:
+            logger.info(f"[品类缺失] 模块未变化（可能设计文本为空或LLM未修改）")
+
         try:
             with CBBMatcher() as matcher:
-                if all_vl_modules:
-                    cbb_match = await matcher.match_modules(
-                        all_vl_modules, llm, product_category=category_l2,
-                    )
+                if target_modules:
+                    cbb_match = matcher.match_modules(target_modules)
                     logger.info(f"[品类缺失] CBB匹配: {cbb_match.matched}/{cbb_match.total} 匹配率{cbb_match.match_rate}%")
-                cbb_summary = matcher.get_cbb_summary()
         except Exception as e:
             logger.error(f"[品类缺失] CBB匹配异常: {e}")
 
@@ -252,12 +277,12 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         # Step 5: LLM评分
         if scenario_b:
             llm_scoring = await self._llm_scoring_scenario_b(
-                vl_report, project_data, gap_info, cbb_summary, cbb_match,
+                vl_report, project_data, gap_info, cbb_match,
                 market_overview, category_sales_summary,
             )
         else:
             llm_scoring = await self._llm_scoring_scenario_a(
-                vl_report, project_data, gap_info, cbb_summary, cbb_match, self_cbb_modules,
+                vl_report, project_data, gap_info, cbb_match, self_cbb_modules,
             )
 
         return {
@@ -321,7 +346,7 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 
     async def _llm_scoring_scenario_a(
         self, vl_report: dict, project_data: dict, gap_info: dict,
-        cbb_summary: str, cbb_match: MatchResult, self_cbb_modules: list,
+        cbb_match: MatchResult, self_cbb_modules: list,
     ) -> dict:
         """场景A LLM评分：复用爆品升级的5维度（模块复用48 + 升级合理性22 + 价格10 + 营销10 + 可行性10）"""
         llm = get_llm_client()
@@ -367,7 +392,7 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         pricing = project_data.get("pricing", "")
         erp_cost = project_data.get("erp_cost", "")
         competitor_price = project_data.get("competitor_price", "")
-        selling_point = project_data.get("similar_product_selling_point", "") or project_data.get("product_hotpoint", "")
+        selling_point = project_data.get("similar_product_selling_point", "")
 
         prompt = f"""你是资深的电商产品立项审核专家，精通模块化产品分析和供应链评估。
 
@@ -377,13 +402,10 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 ## 品类缺失信息
 {gap_info.get('gap_description', '')}
 
-## CBB模块库分类体系（供参考）
-{cbb_summary[:2000]}
-
 ## 自家产品已关联的CBB模块
 {self_cbb_str}
 
-## 竞品独有模块的CBB匹配结果（sub_type级别）
+## 竞品独有模块的CBB匹配结果（FAISS语义检索）
 {cbb_match_str}
 
 ## VL对比拆解结果（自家 vs 竞品）
@@ -440,7 +462,12 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 - 升级必要性(6分): 目标→动作逻辑链是否合理
 
 ### 价格分析（10分）、营销分析（10分）、可行性分析（10分）
-- 结合CBB匹配结果：已匹配的模块可获取性高"""
+- 结合CBB匹配结果：已匹配的模块可获取性高
+
+### 重要规则
+- 字段标注"(未填写)"的，表示数据缺失而非该项能力差。请给该项中间分（满分的50%-60%），不要给0分。
+- 只有当字段已填写但内容明显不佳时，才给低分。
+- CBB匹配结果为"无CBB匹配数据"时，表示检索未执行而非模块不可复用，请给该项中间分。"""
 
         return await self._call_llm(llm, prompt)
 
@@ -450,7 +477,7 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 
     async def _llm_scoring_scenario_b(
         self, vl_report: dict, project_data: dict, gap_info: dict,
-        cbb_summary: str, cbb_match: MatchResult,
+        cbb_match: MatchResult,
         market_overview: dict, category_sales_summary: dict,
     ) -> dict:
         """场景B LLM评分：3维度（模块可行性50 + 设计合理性30 + 价格市场20）"""
@@ -458,8 +485,10 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         if not llm.is_available:
             return {"_error": "LLM不可用"}
 
-        # VL单拆结果
+        # VL单拆结果（兼容单拆和对比两种模式）
         comp_modules = vl_report.get("competitor_modules", [])
+        if not comp_modules:
+            comp_modules = vl_report.get("section2_abc_modules", {}).get("b_level", [])
         section1 = vl_report.get("section1_visual_analysis", {})
         section3 = vl_report.get("section3_module_comparison", {})
 
@@ -511,10 +540,7 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 ## 品类缺失信息
 {gap_info.get('gap_description', '')}
 
-## CBB模块库分类体系（供参考）
-{cbb_summary[:2000]}
-
-## 竞品模块的CBB匹配结果（sub_type级别）
+## 竞品模块的CBB匹配结果（FAISS语义检索）
 {cbb_match_str}
 
 ## VL拆解结果（仅竞品）
@@ -541,12 +567,14 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 {{
   "module_feasibility": {{
     "score": 0-50,
-    "cbb_reuse_score": 0-25,
-    "cbb_reuse_reason": "CBB直接复用评估：竞品模块在CBB库中能找到sub_type匹配的占比",
-    "acquisition_score": 0-15,
-    "acquisition_reason": "模块可获取性评估：可行性分析中提到可直接获取的模块",
-    "tooling_score": 0-10,
-    "tooling_reason": "开模难度评估：需开模模块的数量和复杂度"
+    "fabric_score": 0-15,
+    "fabric_reason": "面料可行性：竞品面料是否在CBB面料库中有匹配，或可行性分析中提到可直接采购",
+    "pattern_score": 0-15,
+    "pattern_reason": "版型可行性：竞品版型是否在CBB版型库中有匹配，或是否有相似版型可改造",
+    "acquisition_score": 0-12,
+    "acquisition_reason": "其它模块可获取性：支撑件/魔术贴/织带/配件等标准件的可获取性（非面料非版型的模块）",
+    "tooling_score": 0-8,
+    "tooling_reason": "开模难度：需开模模块的数量和复杂度"
   }},
   "design_rationality": {{
     "score": 0-30,
@@ -569,9 +597,10 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 ## 评分标准
 
 ### 模块可行性（50分）
-- CBB直接复用（25分）：参考上方CBB匹配结果，已匹配到sub_type的模块占比越高分越高
-- 模块可获取（15分）：可行性分析中明确提到可直接获取（供应商供货、现有产线）的模块
-- 开模难度（10分）：需开模的模块越少、越简单，分越高
+- 面料可行性（15分）：竞品使用的面料在CBB面料库中是否有匹配？有=12-15分，相似=8-11分，无=0-7分。面料是核心模块，找不到匹配意味着需要重新开发或寻找新供应商，风险最高。
+- 版型可行性（15分）：竞品的版型在CBB版型库中是否有匹配？有=12-15分，相似=8-11分，无=0-7分。版型是产品形态基础，需要开模或打样，开发周期长。
+- 其它模块可获取性（12分）：支撑件/魔术贴/织带/配件等标准件，这些是通用件，市场上容易采购。参考CBB匹配结果和可行性分析，大部分可获取=9-12分，部分可获取=5-8分，困难=0-4分。
+- 开模难度（8分）：需开模的模块越少、越简单，分越高。无需开模=7-8分，1-2个简单开模=4-6分，多个复杂开模=0-3分。
 
 ### 产品设计合理性（30分）
 - 设计目的明确性（10分）：ABC分类明确、设计目的清晰
@@ -580,7 +609,12 @@ class CategoryGapAnalyzer(BaseAnalyzer):
 
 ### 价格与市场（20分）
 - 价格竞争力（10分）：定价vs竞品偏差在合理范围内（±10%内=10分，±20%=7分，超20%=3分）
-- 市场验证（10分）：品类有竞品销量验证=高分，无验证=低分"""
+- 市场验证（10分）：品类有竞品销量验证=高分，无验证=低分
+
+### 重要规则
+- 字段标注"(未填写)"的，表示数据缺失而非该项能力差。请给该项中间分（满分的50%-60%），不要给0分。
+- 只有当字段已填写但内容明显不佳时，才给低分。
+- CBB匹配结果为"无CBB匹配数据"时，表示检索未执行而非模块不可复用，请给该项中间分。"""
 
         return await self._call_llm(llm, prompt)
 
@@ -589,17 +623,49 @@ class CategoryGapAnalyzer(BaseAnalyzer):
     # ============================================================
 
     def _format_cbb_match(self, cbb_match: MatchResult) -> str:
-        """格式化CBB匹配结果为文本"""
+        """格式化CBB匹配结果为文本，面料/版型单独高亮"""
         if not cbb_match or not cbb_match.module_matches:
             return "  (无CBB匹配数据)"
-        lines = [f"匹配率: {cbb_match.match_rate}% ({cbb_match.matched}/{cbb_match.total})"]
+
+        # 按类别分组
+        fabric_matches = []
+        pattern_matches = []
+        other_matches = []
+
         for mm in cbb_match.module_matches:
+            score_str = f" score={mm.score:.2f}" if mm.score else ""
             modules_info = ""
             if mm.cbb_modules:
                 modules_info = " → " + ", ".join(
                     f"{m['cbb_name']}({m['cbb_code']})" for m in mm.cbb_modules[:3]
                 )
-            lines.append(f"  - {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}]{modules_info}")
+            line = f"  - {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}{score_str}]{modules_info}"
+
+            if mm.cbb_category == "FABRIC":
+                fabric_matches.append(line)
+            elif mm.cbb_category == "PATTERN":
+                pattern_matches.append(line)
+            else:
+                other_matches.append(line)
+
+        lines = [f"总匹配率: {cbb_match.match_rate}% ({cbb_match.matched}/{cbb_match.total})"]
+
+        if fabric_matches:
+            lines.append(f"\n【面料 FABRIC】({len(fabric_matches)}个)")
+            lines.extend(fabric_matches)
+        else:
+            lines.append("\n【面料 FABRIC】(无匹配模块)")
+
+        if pattern_matches:
+            lines.append(f"\n【版型 PATTERN】({len(pattern_matches)}个)")
+            lines.extend(pattern_matches)
+        else:
+            lines.append("\n【版型 PATTERN】(无匹配模块)")
+
+        if other_matches:
+            lines.append(f"\n【其它模块】({len(other_matches)}个)")
+            lines.extend(other_matches)
+
         return "\n".join(lines)
 
     async def _call_llm(self, llm, prompt: str) -> dict:
@@ -753,13 +819,15 @@ class CategoryGapAnalyzer(BaseAnalyzer):
         """场景B评分：3维度"""
         mf = llm_scoring.get("module_feasibility", {})
         if mf and not mf.get("_error"):
-            cbb_reuse = min(max(mf.get("cbb_reuse_score", 12), 0), 25)
-            acquisition = min(max(mf.get("acquisition_score", 7), 0), 15)
-            tooling = min(max(mf.get("tooling_score", 5), 0), 10)
-            feasibility_score = cbb_reuse + acquisition + tooling
-            feasibility_reason = (f"CBB复用{cbb_reuse}/25: {mf.get('cbb_reuse_reason', '')[:60]}\n"
-                                  f"    模块可获取{acquisition}/15: {mf.get('acquisition_reason', '')[:60]}\n"
-                                  f"    开模难度{tooling}/10: {mf.get('tooling_reason', '')[:60]}")
+            fabric = min(max(mf.get("fabric_score", 7), 0), 15)
+            pattern = min(max(mf.get("pattern_score", 7), 0), 15)
+            acquisition = min(max(mf.get("acquisition_score", 6), 0), 12)
+            tooling = min(max(mf.get("tooling_score", 4), 0), 8)
+            feasibility_score = fabric + pattern + acquisition + tooling
+            feasibility_reason = (f"面料{fabric}/15: {mf.get('fabric_reason', '')[:60]}\n"
+                                  f"    版型{pattern}/15: {mf.get('pattern_reason', '')[:60]}\n"
+                                  f"    其它模块{acquisition}/12: {mf.get('acquisition_reason', '')[:60]}\n"
+                                  f"    开模难度{tooling}/8: {mf.get('tooling_reason', '')[:60]}")
         else:
             feasibility_score = 25
             feasibility_reason = "LLM评分不可用"
@@ -873,85 +941,293 @@ class CategoryGapAnalyzer(BaseAnalyzer):
     # ============================================================
 
     def format_report(self, analysis_result: dict, score: AnalyzerScore = None) -> str:
-        """格式化品类地图缺失分析结果"""
+        """格式化品类地图缺失分析结果（V2 — 丰富版）"""
         if not analysis_result:
             return "  (品类地图缺失分析不可用)"
 
         scenario = analysis_result.get("scenario", "B")
         lines = []
-        lines.append("[🗺️ 品类地图缺失分析]")
 
-        # 评分总览
+        # ── 评分总览 ──
         if score:
-            lines.append(f"  场景: {'品牌缺失（复用爆品升级评分）' if scenario == 'A' else '品类缺失'}")
-            lines.append(f"  评分: {score.total_score}/100 {'★' * score.star_rating}{'☆' * (5 - score.star_rating)} 风险: {score.risk_level}")
+            lines.append(f"  综合评分: {score.total_score}/100 {'★' * score.star_rating + '☆' * (5 - score.star_rating)}  风险等级: {score.risk_level}")
+            lines.append("")
             for d in score.dimensions:
-                lines.append(f"    {d.name}: {d.score}/{d.max_score} - {d.reason[:80]}")
+                bar_len = int(d.score / d.max_score * 20)
+                bar = "█" * bar_len + "░" * (20 - bar_len)
+                lines.append(f"  {d.name}: {d.score}/{d.max_score}  [{bar}]")
             lines.append("")
 
-        # 场景判断
+        # ── 场景判断 ──
         gap_info = analysis_result.get("gap_info", {})
         gap_type = analysis_result.get("gap_type", "")
         gap_labels = {
-            "brand_gap": "🔲 品牌缺失（公司有该品类产品，但立项品牌下没有）",
-            "category_gap": "🆕 品类缺失（公司完全没有该品类产品）",
-            "no_gap": "📦 品类补全（同品牌下已有产品）",
+            "brand_gap": "品牌缺失（公司有该品类产品，但立项品牌下没有）",
+            "category_gap": "品类缺失（公司完全没有该品类产品）",
+            "no_gap": "品类补全（同品牌下已有产品）",
         }
+        lines.append("  ── 场景判断 ──")
         lines.append(f"  场景: {gap_labels.get(gap_type, gap_type)}")
         lines.append(f"  {gap_info.get('gap_description', '')}")
 
-        # CBB匹配详情
+        # ── 立项信息 ──
+        project_data = analysis_result.get("project_data", {})
+        if project_data:
+            brand = analysis_result.get("brand", "")
+            cat = analysis_result.get("category_info", {})
+            lines.append("")
+            lines.append("  ── 立项信息 ──")
+            if brand:
+                lines.append(f"  品牌: {brand}")
+            if cat.get("category1") or cat.get("category2") or cat.get("category3"):
+                lines.append(f"  品类: {cat.get('category1', '')} > {cat.get('category2', '')} > {cat.get('category3', '')}")
+            product_name = project_data.get("product_name") or project_data.get("project_name", "")
+            if product_name:
+                lines.append(f"  产品名称: {product_name}")
+            if project_data.get("design_purpose"):
+                lines.append(f"  设计目的: {project_data['design_purpose']}")
+            design_content = project_data.get("design_content") or project_data.get("upgrade_modules", "")
+            if design_content:
+                lines.append(f"  设计内容: {design_content}")
+            feasibility = project_data.get("feasibility_analysis") or project_data.get("upgrade_valiable", "")
+            if feasibility:
+                lines.append(f"  可行性分析: {feasibility}")
+            if project_data.get("pricing"):
+                lines.append(f"  定价: {project_data['pricing']}")
+            if project_data.get("competitor_price"):
+                lines.append(f"  竞品价格: {project_data['competitor_price']}")
+            if project_data.get("market_size"):
+                lines.append(f"  市场大小: {project_data['market_size']}")
+            if project_data.get("estimated_sales"):
+                lines.append(f"  目标销售额: {project_data['estimated_sales']}")
+
+        # ── CBB匹配详情 ──
         cbb_match = analysis_result.get("cbb_match")
         if cbb_match and hasattr(cbb_match, "module_matches") and cbb_match.module_matches:
             lines.append("")
-            lines.append("  ── CBB模块匹配（sub_type级别） ──")
+            lines.append("  ── CBB模块匹配（FAISS语义检索） ──")
             lines.append(f"  匹配率: {cbb_match.match_rate}% ({cbb_match.matched}/{cbb_match.total})")
             for mm in cbb_match.module_matches[:10]:
                 status = "✓" if mm.matched else "✗"
+                score_str = f" score={mm.score:.2f}" if mm.score else ""
                 modules_info = ""
                 if mm.cbb_modules:
                     modules_info = " → " + ", ".join(m["cbb_name"] for m in mm.cbb_modules[:2])
-                lines.append(f"    [{status}] {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}]{modules_info}")
+                lines.append(f"    [{status}] {mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}{score_str}]{modules_info}")
+            lines.append("")
 
-        # VL报告摘要
+        # ── VL拆解详情 ──
         vl_report = analysis_result.get("vl_report", {})
-        if vl_report:
-            section3 = vl_report.get("section3_module_comparison", {})
-            if section3:
-                same = len(section3.get("same_modules", []))
-                comp_only = len(section3.get("competitor_only", []))
-                own_only = len(section3.get("own_only", []))
-                reuse_rate = section3.get("overall_reuse_rate", "N/A")
-                lines.append("")
-                lines.append(f"  ── VL拆解 ──")
-                lines.append(f"  模块对比: 相同{same} / 竞品独有{comp_only} / 自家独有{own_only}, 复用率{reuse_rate}%")
+        if vl_report and "error" not in vl_report:
+            # 场景A：对比模式
+            comparison = vl_report.get("section3_module_comparison", {})
+            if comparison:
+                same = comparison.get("same_modules", [])
+                comp_only = comparison.get("competitor_only", [])
+                own_only = comparison.get("own_only", [])
 
-        # 市场概况
+                if same:
+                    lines.append(f"  可复用模块（{len(same)}个）:")
+                    for m in same[:8]:
+                        name = m.get("module_name", "?")
+                        own = str(m.get("own_detail", ""))[:40]
+                        comp = str(m.get("competitor_detail", ""))[:40]
+                        lines.append(f"    · {name}  —  自家: {own} | 竞品: {comp}")
+                if comp_only:
+                    lines.append(f"  竞品独有模块（{len(comp_only)}个，需补齐）:")
+                    for m in comp_only[:6]:
+                        name = m.get("module_name", "?")
+                        detail = str(m.get("detail", ""))[:50]
+                        lines.append(f"    · {name}  —  {detail}")
+                if own_only:
+                    lines.append(f"  自家独有模块（{len(own_only)}个，差异化优势）:")
+                    for m in own_only[:4]:
+                        name = m.get("module_name", "?")
+                        detail = str(m.get("detail", ""))[:50]
+                        adv = " ✓优势" if m.get("is_advantage") else ""
+                        lines.append(f"    · {name}  —  {detail}{adv}")
+                lines.append("")
+
+            # 场景B：单拆模式
+            b_level = vl_report.get("section2_abc_modules", {}).get("b_level", [])
+            if b_level and not comparison:
+                lines.append(f"  竞品模块拆解（{len(b_level)}个）:")
+                for m in b_level[:10]:
+                    name = m.get("name", "?")
+                    func = m.get("core_function", "")
+                    material = m.get("typical_material", "")
+                    priority = m.get("priority", "")
+                    info_parts = []
+                    if func:
+                        info_parts.append(func)
+                    if material:
+                        info_parts.append(f"材料:{material}")
+                    if priority:
+                        info_parts.append(f"优先级:{priority}")
+                    lines.append(f"    · {name}  —  {' | '.join(info_parts)}")
+                lines.append("")
+
+            # 视觉分析
+            section1 = vl_report.get("section1_visual_analysis", {})
+            if section1:
+                lines.append("  ── 视觉分析 ──")
+                if section1.get("product_type"):
+                    lines.append(f"  产品类型: {section1['product_type']}")
+                if section1.get("structure_form"):
+                    lines.append(f"  结构形态: {section1['structure_form']}")
+                if section1.get("material_texture"):
+                    lines.append(f"  材料质感: {section1['material_texture']}")
+                lines.append("")
+
+        # ── 市场概况 ──
         market_overview = analysis_result.get("market_overview", {})
         if market_overview:
-            lines.append("")
             lines.append("  ── 品类市场概况 ──")
             total_products = market_overview.get("total_products", 0)
             total_sales = market_overview.get("total_category_sales", 0)
             lines.append(f"  品类产品总数: {total_products}个")
             lines.append(f"  品类累计总销量: {total_sales:,}")
+            brand_dist = market_overview.get("brand_distribution", [])
+            if brand_dist:
+                lines.append("  品牌分布:")
+                for bd in brand_dist[:5]:
+                    pct = (bd["total_sales"] / total_sales * 100) if total_sales > 0 else 0
+                    lines.append(f"    · {bd['brand']}: {bd['product_count']}个产品, 销量{bd['total_sales']:,} ({pct:.1f}%)")
+            lines.append("")
 
-        # 优劣势和建议
+        # ── 维度详情 ──
+        llm_scoring = analysis_result.get("llm_scoring", {})
+        if score and llm_scoring and not llm_scoring.get("_error"):
+            if scenario == "A":
+                self._format_scenario_a_details(lines, llm_scoring, score)
+            else:
+                self._format_scenario_b_details(lines, llm_scoring, score)
+
+        # ── 综合评价 ──
         if score:
+            lines.append("  ═══ 综合评价 ═══")
+            lines.append("")
+
             if score.strengths:
-                lines.append("")
                 lines.append("  【优势】")
                 for s in score.strengths:
                     lines.append(f"    + {s}")
-            if score.weaknesses:
                 lines.append("")
+
+            if score.weaknesses:
                 lines.append("  【不足】")
                 for w in score.weaknesses:
                     lines.append(f"    - {w}")
-            if score.suggestions:
                 lines.append("")
+
+            if score.suggestions:
                 lines.append("  【改进建议】")
                 for i, s in enumerate(score.suggestions, 1):
                     lines.append(f"    {i}. {s}")
+                lines.append("")
+
+            # 风险提示
+            lines.append("  【风险提示】")
+            if score.risk_level == "高":
+                lines.append("    该项目整体风险较高，建议在以下方面重点把控后再推进立项：")
+                if scenario == "B":
+                    lines.append("    · 核心模块复用率不足时，需评估新建模块的供应链成本和周期")
+                    lines.append("    · 品类无市场数据验证时，建议先做小规模市场调研")
+                    lines.append("    · 价格与竞品持平但缺乏差异化时，需重新评估产品定位")
+                else:
+                    lines.append("    · 核心模块复用率不足时，需评估新建模块的供应链成本和周期")
+                    lines.append("    · 升级方向缺乏市场验证时，建议先做小规模用户调研")
+                    lines.append("    · 价格与成本不匹配时，需重新评估定价策略或寻找更优供应链")
+            elif score.risk_level == "中":
+                lines.append("    该项目有一定风险，建议关注以下方面：")
+                lines.append("    · 确保设计方向有充分的用户需求支撑")
+                lines.append("    · 关注核心模块的供应链稳定性")
+                lines.append("    · 提前准备差异化卖点，避免与竞品同质化竞争")
+            else:
+                lines.append("    该项目整体风险较低，建议按计划推进，关注以下细节：")
+                lines.append("    · 做好模块品质把控，确保量产稳定性")
+                lines.append("    · 提前锁定核心模块供应商")
 
         return "\n".join(lines)
+
+    def _format_scenario_a_details(self, lines: list, llm_scoring: dict, score: AnalyzerScore):
+        """格式化场景A的维度详情（5维度）"""
+        # 维度1: 模块复用
+        lines.append("  ═══ 维度一：模块复用（48分）═══")
+        d = next((d for d in score.dimensions if d.name == "模块复用"), None)
+        if d:
+            for sub_line in d.reason.split("\n"):
+                lines.append(f"  {sub_line.strip()}")
+        lines.append("")
+
+        # 维度2: 模块升级合理性
+        lines.append("  ═══ 维度二：模块升级合理性（22分）═══")
+        d = next((d for d in score.dimensions if d.name == "模块升级合理性"), None)
+        if d:
+            for sub_line in d.reason.split("\n"):
+                lines.append(f"  {sub_line.strip()}")
+        lines.append("")
+
+        # 维度3: 价格分析
+        lines.append("  ═══ 维度三：价格分析（10分）═══")
+        d = next((d for d in score.dimensions if d.name == "价格分析"), None)
+        if d:
+            for sub_line in d.reason.split("\n"):
+                lines.append(f"  {sub_line.strip()}")
+        lines.append("")
+
+        # 维度4: 营销分析
+        lines.append("  ═══ 维度四：营销分析（10分）═══")
+        d = next((d for d in score.dimensions if d.name == "营销分析"), None)
+        if d:
+            lines.append(f"  {d.reason}")
+        lines.append("")
+
+        # 维度5: 可行性分析
+        lines.append("  ═══ 维度五：可行性分析（10分）═══")
+        d = next((d for d in score.dimensions if d.name == "可行性分析"), None)
+        if d:
+            lines.append(f"  {d.reason}")
+        lines.append("")
+
+    def _format_scenario_b_details(self, lines: list, llm_scoring: dict, score: AnalyzerScore):
+        """格式化场景B的维度详情（3维度）"""
+        mf = llm_scoring.get("module_feasibility", {})
+
+        # 维度1: 模块可行性
+        lines.append("  ═══ 维度一：模块可行性（50分）═══")
+        d = next((d for d in score.dimensions if d.name == "模块可行性"), None)
+        if d:
+            for sub_line in d.reason.split("\n"):
+                lines.append(f"  {sub_line.strip()}")
+        if mf and not mf.get("_error"):
+            lines.append(f"    面料可行性: {mf.get('fabric_reason', '')}")
+            lines.append(f"    版型可行性: {mf.get('pattern_reason', '')}")
+            lines.append(f"    其它模块可获取: {mf.get('acquisition_reason', '')}")
+            lines.append(f"    开模难度: {mf.get('tooling_reason', '')}")
+        lines.append("")
+
+        # 维度2: 产品设计合理性
+        lines.append("  ═══ 维度二：产品设计合理性（30分）═══")
+        d = next((d for d in score.dimensions if d.name == "产品设计合理性"), None)
+        if d:
+            for sub_line in d.reason.split("\n"):
+                lines.append(f"  {sub_line.strip()}")
+        dr = llm_scoring.get("design_rationality", {})
+        if dr and not dr.get("_error"):
+            lines.append(f"    设计目的: {dr.get('purpose_reason', '')}")
+            lines.append(f"    设计方向: {dr.get('direction_reason', '')}")
+            lines.append(f"    差异化: {dr.get('differentiation_reason', '')}")
+        lines.append("")
+
+        # 维度3: 价格与市场
+        lines.append("  ═══ 维度三：价格与市场（20分）═══")
+        d = next((d for d in score.dimensions if d.name == "价格与市场"), None)
+        if d:
+            for sub_line in d.reason.split("\n"):
+                lines.append(f"  {sub_line.strip()}")
+        pm = llm_scoring.get("price_market", {})
+        if pm and not pm.get("_error"):
+            lines.append(f"    价格竞争力: {pm.get('price_reason', '')}")
+            lines.append(f"    市场验证: {pm.get('market_reason', '')}")
+        lines.append("")

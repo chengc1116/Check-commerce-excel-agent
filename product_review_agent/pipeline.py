@@ -743,6 +743,9 @@ async def run_pipeline(file_path: str, task_type: str) -> PipelineResult:
     for img in images:
         if img.get("bytes"):
             image_bytes_list.append(img["bytes"])
+    if image_bytes_list:
+        sizes = [len(b) for b in image_bytes_list]
+        logger.info(f"[Pipeline] 传递给VL的图片: {len(image_bytes_list)}张, 各张大小: {sizes} bytes")
 
     common_analysis, (specific_analysis, specific_score), product_analysis = await asyncio.gather(
         _analyze_common(project_data_clean),

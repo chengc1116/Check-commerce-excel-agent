@@ -47,6 +47,7 @@ from product_review_agent.feishu.card_builder import (
     build_task_selected_card,
     build_no_task_selected_card,
 )
+from product_review_agent.feishu.bitable_writer import write_review_record
 from product_review_agent.feishu.session_manager import (
     SessionManager,
     SessionState,
@@ -156,6 +157,12 @@ logger = logging.getLogger(__name__)
 # 飞书 App 凭证（从环境变量读取，无默认值防止误用旧凭证）
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+
+# 审核报告额外接收人（逗号分隔的 open_id 列表）
+_REPORT_RECEIVERS_RAW = os.getenv("FEISHU_REPORT_RECEIVERS", "")
+REPORT_RECEIVERS: list[str] = [
+    uid.strip() for uid in _REPORT_RECEIVERS_RAW.split(",") if uid.strip()
+]
 
 # 全局会话管理器
 session_manager = SessionManager()
@@ -321,6 +328,107 @@ def _send_file_message(client: lark.Client, chat_id: str, file_key: str, file_na
         return None
 
 
+def _send_file_to_user(client: lark.Client, open_id: str, file_key: str, file_name: str):
+    """发送文件消息到指定用户（通过open_id）"""
+    try:
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("open_id") \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(open_id)
+                .msg_type("file")
+                .content(json.dumps({"file_key": file_key, "file_name": file_name}))
+                .build()
+            ) \
+            .build()
+
+        response = client.im.v1.message.create(request)
+        if response.success():
+            logger.info(f"文件消息发送成功: user={open_id}, file={file_name}")
+        else:
+            logger.error(f"文件消息发送失败: user={open_id}, code={response.code}, msg={response.msg}")
+        return response
+
+    except Exception as e:
+        logger.error(f"发送文件消息异常: {e}", exc_info=True)
+        return None
+
+
+# ============================================================
+# 用户信息 & 通知消息
+# ============================================================
+
+def _get_user_name(client: lark.Client, open_id: str) -> str:
+    """通过飞书API获取用户显示名称，失败时返回open_id"""
+    try:
+        from lark_oapi.api.contact.v3 import GetUserRequest
+
+        request = GetUserRequest.builder() \
+            .user_id(open_id) \
+            .user_id_type("open_id") \
+            .build()
+
+        response = client.contact.v3.user.get(request)
+        if response.success() and response.data and response.data.user:
+            return response.data.user.name or open_id
+        else:
+            logger.warning(f"获取用户名失败: {open_id}, code={response.code}, msg={response.msg}")
+            return open_id
+    except Exception as e:
+        logger.warning(f"获取用户名异常: {open_id}, {e}")
+        return open_id
+
+
+def _send_text_to_user(client: lark.Client, open_id: str, text: str):
+    """发送文本消息到指定用户（通过open_id）"""
+    try:
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("open_id") \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(open_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text}))
+                .build()
+            ) \
+            .build()
+
+        response = client.im.v1.message.create(request)
+        if response.success():
+            logger.info(f"文本消息发送成功: user={open_id}")
+        else:
+            logger.error(f"文本消息发送失败: user={open_id}, code={response.code}, msg={response.msg}")
+        return response
+
+    except Exception as e:
+        logger.error(f"发送文本消息异常: {e}", exc_info=True)
+        return None
+
+
+def _build_receiver_notification(
+    sender_name: str,
+    product_name: str,
+    task_label: str,
+    overall_score: int,
+    risk_level: str,
+    file_name: str,
+) -> str:
+    """构建发送给接收人的通知消息"""
+    risk_emoji = {"低": "✅", "中": "⚠️", "高": "❌"}.get(risk_level, "❓")
+    return (
+        f"📋 立项审核报告通知\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"提交人: {sender_name}\n"
+        f"产品名称: {product_name}\n"
+        f"审核类型: {task_label}\n"
+        f"文件名称: {file_name}\n"
+        f"综合评分: {overall_score}/100 {risk_emoji}\n"
+        f"风险等级: {risk_level}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"以下为审核报告和原始文件，请查收。"
+    )
+
+
 # ============================================================
 # 后台审核任务（独立线程，独立Client）
 # ============================================================
@@ -331,6 +439,7 @@ def _run_review_in_thread(
     file_key: str,
     file_name: str,
     task_type: Optional[TaskType] = None,
+    user_id: str = "",
 ):
     """
     在独立线程中执行完整审核流程。
@@ -402,6 +511,26 @@ def _run_review_in_thread(
             logger.error(f"[{tname}] 审核出错: {result.error}")
             return
 
+        # Step 3.5: 写入飞书多维表格
+        pd = result.project_data or {}
+        product_name = pd.get("project_name") or pd.get("product_name", "未知")
+        category_l1 = pd.get("category_l1") or pd.get("categoryl1", "")
+        sender_name = _get_user_name(worker_client, user_id)
+        try:
+            write_review_record(
+                client=worker_client,
+                product_name=product_name,
+                category_l1=category_l1,
+                task_label=result.task_label or task_label,
+                overall_score=result.overall_score,
+                risk_level=result.risk_level,
+                submitter=sender_name,
+                file_name=file_name,
+            )
+            logger.info(f"[{tname}] 多维表格写入完成")
+        except Exception as bt_err:
+            logger.warning(f"[{tname}] 多维表格写入失败（不影响主流程）: {bt_err}")
+
         # 构建评分信息（兼容旧卡片格式）
         scores = result.common_scores or {}
 
@@ -463,18 +592,43 @@ def _run_review_in_thread(
             )
             logger.info(f"[{tname}] Word 报告已生成: {docx_path}")
 
-            # 上传文件到飞书并发送
-            file_key = _upload_file_to_feishu(worker_client, docx_path)
-            if file_key:
-                _send_file_message(worker_client, chat_id, file_key, os.path.basename(docx_path))
+            # 上传文件到飞书并发送给提交人
+            docx_file_key = _upload_file_to_feishu(worker_client, docx_path)
+            if docx_file_key:
+                _send_file_message(worker_client, chat_id, docx_file_key, os.path.basename(docx_path))
                 logger.info(f"[{tname}] Word 报告已发送到飞书")
             else:
                 logger.warning(f"[{tname}] Word 报告上传失败，改发文本摘要")
-                # 降级：上传失败时发送简短文本
                 reply_text_message(
                     worker_client, message_id,
                     f"Word报告上传失败，综合评分: {result.overall_score}/100，风险等级: {result.risk_level}"
                 )
+
+            # Step 5: 将报告和原始Excel发送给配置的额外接收人
+            if REPORT_RECEIVERS and docx_file_key:
+                logger.info(f"[{tname}] Step 5/5: 发送报告给额外接收人 ({len(REPORT_RECEIVERS)}人)...")
+                # 获取提交人名称
+                sender_name = _get_user_name(worker_client, user_id)
+                # 从项目数据中提取产品名称
+                product_name = (result.project_data or {}).get("project_name") \
+                    or (result.project_data or {}).get("product_name", "未知")
+                # 构建通知消息
+                notify_text = _build_receiver_notification(
+                    sender_name=sender_name,
+                    product_name=product_name,
+                    task_label=result.task_label or task_label,
+                    overall_score=result.overall_score,
+                    risk_level=result.risk_level,
+                    file_name=file_name,
+                )
+                # 上传原始Excel文件
+                excel_file_key = _upload_file_to_feishu(worker_client, local_path)
+                for uid in REPORT_RECEIVERS:
+                    _send_text_to_user(worker_client, uid, notify_text)
+                    _send_file_to_user(worker_client, uid, docx_file_key, os.path.basename(docx_path))
+                    if excel_file_key:
+                        _send_file_to_user(worker_client, uid, excel_file_key, file_name)
+                    logger.info(f"[{tname}] 已发送给接收人: {uid}")
 
             # 清理临时文件
             try:
@@ -608,7 +762,7 @@ def on_message_receive(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         # 在独立线程中执行审核
         thread = threading.Thread(
             target=_run_review_in_thread,
-            args=(message_id, chat_id, file_key, file_name, task_type),
+            args=(message_id, chat_id, file_key, file_name, task_type, user_id),
             name=f"review-{file_name[:15]}",
             daemon=True,
         )

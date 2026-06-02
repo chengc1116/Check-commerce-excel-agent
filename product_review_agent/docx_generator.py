@@ -208,29 +208,88 @@ def generate_review_docx(
         if task_label and "爆品" in task_label:
             _add_hot_upgrade_dimension_details(doc, specific_score)
 
-    # 升级信息详情
+        # 品类缺失维度详细评语
+        if task_label and "品类" in task_label:
+            scenario = specific_analysis.get("scenario", "B") if specific_analysis else "B"
+            _add_category_gap_dimension_details(doc, specific_score, scenario)
+
+        # 竞品升级5维度详细评语
+        if task_label and "竞品" in task_label:
+            _add_competitor_upgrade_dimension_details(doc, specific_score)
+
+        # 未起量迭代5维度详细评语
+        if task_label and "未起量" in task_label:
+            _add_low_sale_iterate_dimension_details(doc, specific_score)
+
+    # 立项信息详情
     proj = specific_analysis.get("project_data", {}) if specific_analysis else {}
     if proj:
         detail_items = []
+        # 爆品升级字段
         if proj.get("upgrade_modules"):
             detail_items.append(("升级模块", proj["upgrade_modules"]))
         if proj.get("design_purpose"):
-            detail_items.append(("升级目的", proj["design_purpose"]))
+            detail_items.append(("设计目的", proj["design_purpose"]))
         if proj.get("product_hotpoint"):
             detail_items.append(("原有卖点", proj["product_hotpoint"]))
         if proj.get("upgrade_valiable"):
             detail_items.append(("可行性说明", proj["upgrade_valiable"]))
+        # 竞品升级字段
+        if proj.get("competitor_strengths_copy"):
+            detail_items.append(("竞品卖点-需复制", proj["competitor_strengths_copy"]))
+        if proj.get("competitor_advantage"):
+            detail_items.append(("竞品卖点-需超越", proj["competitor_advantage"]))
+        # 未起量迭代字段
+        if proj.get("failure_analysis"):
+            detail_items.append(("没卖好的原因", proj["failure_analysis"]))
+        if proj.get("current_issues"):
+            detail_items.append(("当前产品问题", proj["current_issues"]))
+        if proj.get("sales_data_desc"):
+            detail_items.append(("销量现状", proj["sales_data_desc"]))
+        # 品类缺失字段
+        design_content = proj.get("design_content") or proj.get("upgrade_modules", "")
+        if design_content and not proj.get("upgrade_modules"):
+            detail_items.append(("设计内容", design_content))
+        feasibility = proj.get("feasibility_analysis") or proj.get("upgrade_valiable", "")
+        if feasibility and not proj.get("upgrade_valiable"):
+            detail_items.append(("可行性分析", feasibility))
+        if proj.get("audience_consistent"):
+            detail_items.append(("二级品类人群一致性", proj["audience_consistent"]))
+        if proj.get("market_size"):
+            detail_items.append(("市场大小", proj["market_size"]))
+        if proj.get("estimated_sales"):
+            detail_items.append(("目标销售额", proj["estimated_sales"]))
+        # 通用字段
         if proj.get("pricing"):
             detail_items.append(("定价", proj["pricing"]))
         if proj.get("erp_cost"):
-            detail_items.append(("ERP成本", proj["erp_cost"]))
+            detail_items.append(("ERP成本", str(proj["erp_cost"])))
+        if proj.get("competitor_price"):
+            detail_items.append(("竞品价格", str(proj["competitor_price"])))
         if detail_items:
             _add_kv_table(doc, detail_items)
+
+    # 品类缺失场景判断
+    if task_label and "品类" in task_label and specific_analysis:
+        _add_category_gap_scenario_section(doc, specific_analysis)
+
+    # CBB匹配详情
+    if specific_analysis:
+        _add_cbb_match_section(doc, specific_analysis)
+
+    # 品类市场概况
+    if task_label and "品类" in task_label and specific_analysis:
+        _add_market_overview_section(doc, specific_analysis)
 
     # VL对比拆解详细内容
     vl_report = specific_analysis.get("vl_report", {}) if specific_analysis else {}
     if vl_report and "error" not in vl_report:
-        _add_vl_report_sections(doc, vl_report)
+        # 对比模式（有section3）
+        if vl_report.get("section3_module_comparison"):
+            _add_vl_report_sections(doc, vl_report)
+        # 单拆模式（场景B：只有b_level）
+        elif vl_report.get("section2_abc_modules", {}).get("b_level"):
+            _add_single_vl_report(doc, vl_report)
 
     # 模块CBB分类映射
     llm_scoring = specific_analysis.get("llm_scoring", {}) if specific_analysis else {}
@@ -1176,3 +1235,293 @@ def _get_specific_total(specific_score: dict) -> int:
     if hasattr(specific_score, "total_score"):
         return specific_score.total_score
     return 0
+
+
+def _add_category_gap_dimension_details(doc, specific_score: dict, scenario: str):
+    """为品类缺失添加维度详细评语段落"""
+    dimensions = specific_score.get("dimensions", [])
+    if not dimensions:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 各维度详细评语 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    if scenario == "A":
+        dim_labels = {
+            "模块复用": "模块复用（48分）: CBB sub_type匹配 + VL对比覆盖率",
+            "模块升级合理性": "模块升级合理性（22分）: 目标-动作一致性 + 卖点保留度 + 升级必要性",
+            "价格分析": "价格分析（10分）: 定价竞争力 + 成本-定价匹配度",
+            "营销分析": "营销分析（10分）: 升级卖点的营销价值",
+            "可行性分析": "可行性分析（10分）: 供应链/打样可行性",
+        }
+    else:
+        dim_labels = {
+            "模块可行性": "模块可行性（50分）: 面料可行性15 + 版型可行性15 + 其它模块可获取性12 + 开模难度8",
+            "产品设计合理性": "产品设计合理性（30分）: 设计目的明确性 + 设计方向合理性 + 差异化价值",
+            "价格与市场": "价格与市场（20分）: 价格竞争力 + 市场验证",
+        }
+
+    for dim in dimensions:
+        if not isinstance(dim, dict):
+            continue
+        name = dim.get("name", "")
+        score = dim.get("score", 0)
+        max_s = dim.get("max_score", 10)
+        reason = dim.get("reason", "")
+
+        label = dim_labels.get(name, f"{name}（{max_s}分）")
+        p = doc.add_paragraph()
+        run = p.add_run(f"【{label}】")
+        run.bold = True
+        run.font.size = Pt(10.5)
+
+        score_color = COLOR_GREEN if score >= max_s * 0.7 else (RGBColor(0xFF, 0x99, 0x00) if score >= max_s * 0.4 else COLOR_RED)
+        p2 = doc.add_paragraph()
+        run2 = p2.add_run(f"得分: {score}/{max_s}")
+        run2.bold = True
+        run2.font.color.rgb = score_color
+
+        if reason:
+            for line in reason.split("\n"):
+                line = line.strip()
+                if line:
+                    doc.add_paragraph(line)
+
+
+def _add_competitor_upgrade_dimension_details(doc, specific_score: dict):
+    """为竞品升级添加5维度详细评语段落"""
+    dimensions = specific_score.get("dimensions", [])
+    if not dimensions:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 各维度详细评语 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    dim_labels = {
+        "模块复用基础": "模块复用基础（35分）: CBB模块匹配 + 自家-竞品模块重叠度",
+        "卖点复制可行性": "卖点复制可行性（25分）: 竞品核心卖点可复制性 + 卖点保留度",
+        "差异化超越空间": "差异化超越空间（20分）: 竞品优势可超越性 + 差异化方向",
+        "价格竞争力": "价格竞争力（10分）: 升级后定价vs竞品价格偏差",
+        "市场验证": "市场验证（10分）: 竞品销量 + 品牌数验证需求存在性",
+    }
+
+    for dim in dimensions:
+        if not isinstance(dim, dict):
+            continue
+        name = dim.get("name", "")
+        score = dim.get("score", 0)
+        max_s = dim.get("max_score", 10)
+        reason = dim.get("reason", "")
+
+        label = dim_labels.get(name, f"{name}（{max_s}分）")
+        p = doc.add_paragraph()
+        run = p.add_run(f"【{label}】")
+        run.bold = True
+        run.font.size = Pt(10.5)
+
+        score_color = COLOR_GREEN if score >= max_s * 0.7 else (RGBColor(0xFF, 0x99, 0x00) if score >= max_s * 0.4 else COLOR_RED)
+        p2 = doc.add_paragraph()
+        run2 = p2.add_run(f"得分: {score}/{max_s}")
+        run2.bold = True
+        run2.font.color.rgb = score_color
+
+        if reason:
+            for line in reason.split("\n"):
+                line = line.strip()
+                if line:
+                    doc.add_paragraph(line)
+
+
+def _add_low_sale_iterate_dimension_details(doc, specific_score: dict):
+    """为未起量迭代添加5维度详细评语段落"""
+    dimensions = specific_score.get("dimensions", [])
+    if not dimensions:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 各维度详细评语 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    dim_labels = {
+        "问题诊断": "问题诊断（25分）: 没卖好的原因是否找对",
+        "迭代-诊断一致性": "迭代-诊断一致性（25分）: 提出的改动能否解决诊断问题",
+        "模块复用基础": "模块复用基础（20分）: 现有CBB模块复用率",
+        "增量空间": "增量空间（15分）: 竞品验证 + 市场容量",
+        "风险可控度": "风险可控度（15分）: 已起量产品冲突 + 新建成本",
+    }
+
+    for dim in dimensions:
+        if not isinstance(dim, dict):
+            continue
+        name = dim.get("name", "")
+        score = dim.get("score", 0)
+        max_s = dim.get("max_score", 10)
+        reason = dim.get("reason", "")
+
+        label = dim_labels.get(name, f"{name}（{max_s}分）")
+        p = doc.add_paragraph()
+        run = p.add_run(f"【{label}】")
+        run.bold = True
+        run.font.size = Pt(10.5)
+
+        score_color = COLOR_GREEN if score >= max_s * 0.7 else (RGBColor(0xFF, 0x99, 0x00) if score >= max_s * 0.4 else COLOR_RED)
+        p2 = doc.add_paragraph()
+        run2 = p2.add_run(f"得分: {score}/{max_s}")
+        run2.bold = True
+        run2.font.color.rgb = score_color
+
+        if reason:
+            for line in reason.split("\n"):
+                line = line.strip()
+                if line:
+                    doc.add_paragraph(line)
+
+
+def _add_category_gap_scenario_section(doc, specific_analysis: dict):
+    """品类缺失场景判断信息"""
+    gap_info = specific_analysis.get("gap_info", {})
+    gap_type = specific_analysis.get("gap_type", "")
+    if not gap_info:
+        return
+
+    gap_labels = {
+        "brand_gap": "品牌缺失（公司有该品类产品，但立项品牌下没有）",
+        "category_gap": "品类缺失（公司完全没有该品类产品）",
+        "no_gap": "品类补全（同品牌下已有产品）",
+    }
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 场景判断 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    items = []
+    label = gap_labels.get(gap_type, gap_type)
+    items.append(("场景类型", label))
+    if gap_info.get("gap_description"):
+        items.append(("缺失描述", gap_info["gap_description"]))
+    if items:
+        _add_kv_table(doc, items)
+
+
+def _add_cbb_match_section(doc, specific_analysis: dict):
+    """CBB模块匹配详情"""
+    cbb_match = specific_analysis.get("cbb_match")
+    if not cbb_match or not hasattr(cbb_match, "module_matches"):
+        return
+    if not cbb_match.module_matches:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── CBB模块匹配（FAISS语义检索） ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    p = doc.add_paragraph()
+    run = p.add_run(f"匹配率: {cbb_match.match_rate}% ({cbb_match.matched}/{cbb_match.total})")
+    run.bold = True
+
+    for mm in cbb_match.module_matches[:10]:
+        status = "✓" if mm.matched else "✗"
+        score_str = f" score={mm.score:.2f}" if mm.score else ""
+        modules_info = ""
+        if mm.cbb_modules:
+            modules_info = " → " + ", ".join(m["cbb_name"] for m in mm.cbb_modules[:2])
+        color = COLOR_GREEN if mm.matched else COLOR_RED
+        p = doc.add_paragraph(style="List Bullet")
+        run = p.add_run(f"[{status}] ")
+        run.font.color.rgb = color
+        p.add_run(f"{mm.vl_module} → {mm.cbb_category}/{mm.cbb_sub_type} [{mm.match_level}{score_str}]{modules_info}")
+
+
+def _add_market_overview_section(doc, specific_analysis: dict):
+    """品类市场概况"""
+    market = specific_analysis.get("market_overview", {})
+    if not market:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 品类市场概况 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    total_products = market.get("total_products", 0)
+    total_sales = market.get("total_category_sales", 0)
+
+    items = []
+    items.append(("品类产品总数", f"{total_products}个"))
+    items.append(("品类累计总销量", f"{total_sales:,}"))
+    _add_kv_table(doc, items)
+
+    brand_dist = market.get("brand_distribution", [])
+    if brand_dist:
+        p = doc.add_paragraph()
+        run = p.add_run("品牌分布:")
+        run.bold = True
+        for bd in brand_dist[:5]:
+            pct = (bd["total_sales"] / total_sales * 100) if total_sales > 0 else 0
+            doc.add_paragraph(
+                f"{bd['brand']}: {bd['product_count']}个产品, 销量{bd['total_sales']:,} ({pct:.1f}%)",
+                style="List Bullet"
+            )
+
+
+def _add_single_vl_report(doc, vl_report: dict):
+    """单拆模式的VL报告（场景B：无对比，只有竞品模块拆解）"""
+    b_level = vl_report.get("section2_abc_modules", {}).get("b_level", [])
+    if not b_level:
+        return
+
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    run = p.add_run("── 竞品模块拆解 ──")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    p = doc.add_paragraph()
+    run = p.add_run(f"共拆解出 {len(b_level)} 个模块")
+    run.bold = True
+
+    for m in b_level[:10]:
+        name = m.get("name", "?")
+        func = m.get("core_function", "")
+        material = m.get("typical_material", "")
+        priority = m.get("priority", "")
+        parts = [name]
+        if func:
+            parts.append(func)
+        if material:
+            parts.append(f"材料:{material}")
+        if priority:
+            parts.append(f"优先级:{priority}")
+        doc.add_paragraph(" | ".join(parts), style="List Bullet")
+
+    # 视觉分析
+    section1 = vl_report.get("section1_visual_analysis", {})
+    if section1:
+        doc.add_paragraph("")
+        p = doc.add_paragraph()
+        run = p.add_run("── 视觉分析 ──")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        vis_items = []
+        if section1.get("product_type"):
+            vis_items.append(("产品类型", section1["product_type"]))
+        if section1.get("structure_form"):
+            vis_items.append(("结构形态", section1["structure_form"]))
+        if section1.get("material_texture"):
+            vis_items.append(("材料质感", section1["material_texture"]))
+        if vis_items:
+            _add_kv_table(doc, vis_items)
